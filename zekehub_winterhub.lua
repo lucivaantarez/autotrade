@@ -197,7 +197,16 @@ local function summarize(items)
     return result
 end
 
-local function send_trade_webhook(items)
+local function format_duration(seconds)
+    seconds = math.floor(seconds)
+    local hours = math.floor(seconds / 3600)
+    local minutes = math.floor(seconds % 3600 / 60)
+    local remaining = seconds % 60
+    return hours > 0 and string.format("%dh %dm %ds", hours, minutes, remaining)
+        or string.format("%dm %ds", minutes, remaining)
+end
+
+local function send_trade_webhook(items, trade_number, elapsed)
     if not request_fn or webhook_url == "" or CONFIG.Webhook.Enabled == false then return end
     local lines = {}
     for _, item in ipairs(items) do lines[#lines + 1] = string.format("%dx %s", item.qty, item.name) end
@@ -207,6 +216,10 @@ local function send_trade_webhook(items)
             title = "Trade complete",
             description = #lines > 0 and table.concat(lines, "\n") or "No received items",
             color = 5763719,
+            fields = {
+                { name = "Trade count", value = tostring(trade_number), inline = true },
+                { name = "Running for", value = format_duration(elapsed), inline = true },
+            },
             footer = { text = LocalPlayer.Name },
             timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
         }},
@@ -274,7 +287,7 @@ task.spawn(function()
                 if completed then
                     trade_count = trade_count + 1
                     last_items = summarize(received)
-                    task.spawn(send_trade_webhook, last_items)
+                    task.spawn(send_trade_webhook, last_items, trade_count, os.clock() - started_at)
                     log("trade completed", trade_count)
                 end
                 completed, received = false, nil
