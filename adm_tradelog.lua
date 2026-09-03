@@ -24,7 +24,7 @@ local CONFIG = {
     ENABLED = true,
 
     WEBHOOK = {
-        enabled = true,
+        enabled = false, -- local workspace logging works without a webhook
         url = "https://saturnity.site/api/tradelog",
         token = (getgenv and getgenv().SATURNITY_TRADELOG_TOKEN) or "",
     },
@@ -39,8 +39,9 @@ local CONFIG = {
 
     BUFFER = 40,     -- recent trade-remote lines to keep
     POLL   = 0.4,    -- state poll interval (match the autotrade)
+    FLUSH  = 2,      -- continuously refresh the workspace debug log
     FAILURE_GRACE = 2, -- allow the failure toast to appear after the trade closes
-    DEBUG  = true,     -- temporary notification-pipeline tracing
+    DEBUG  = false,
 }
 
 --[[=====================================================================
@@ -70,6 +71,7 @@ pcall(function() UIManager = load("UIManager") end)
 local function ensure_kinddb() if not KindDB then pcall(function() KindDB = load("KindDB") end) end end
 
 local LOG_FILE   = LocalPlayer.Name .. "_tradefails.log"
+local DEBUG_FILE = LocalPlayer.Name .. "_tradelog_debug.log"
 local _writefile = writefile
 local _readfile  = readfile
 local _isfile    = isfile
@@ -110,10 +112,14 @@ end
     Recent trade-remote recorder (pcall-guarded __namecall hook).
     Only keeps trade-relevant remotes so the buffer stays focused.
 --------------------------------------------------------------------]]
-local REMOTES = {}
+local REMOTES, CONSOLE = {}, {}
 local function push_remote(line)
     REMOTES[#REMOTES+1] = line
     if #REMOTES > CONFIG.BUFFER then table.remove(REMOTES, 1) end
+end
+local function push_console(line)
+    CONSOLE[#CONSOLE+1] = line
+    if #CONSOLE > CONFIG.BUFFER then table.remove(CONSOLE, 1) end
 end
 
 local TRADE_HINTS = { "Offer", "Trade", "trade", "Accept", "Confirm", "confirm" }
@@ -168,7 +174,12 @@ local function note_if_fail(text, should_record)
     return false
 end
 pcall(function()
-    LogService.MessageOut:Connect(function(msg) pcall(note_if_fail, msg) end)
+    LogService.MessageOut:Connect(function(msg, message_type)
+        pcall(function()
+            push_console(string.format("%s  %s  %s", stamp(), tostring(message_type), tostring(msg):gsub("[\r\n]", " "):sub(1, 300)))
+            note_if_fail(msg)
+        end)
+    end)
 end)
 local function scan_gui_for_fail()
     local found = false
@@ -183,7 +194,6 @@ local function scan_gui_for_fail()
     end
     failure_visible = found
 end
-
 --[[--------------------------------------------------------------------
     Trade state watcher.
 --------------------------------------------------------------------]]
@@ -225,6 +235,8 @@ local function report_fail(kind_str, snapshot)
     local partner_lines = summarize(snapshot.partner_items)
     local remotes_tail  = {}
     for i = math.max(1, #REMOTES - 12), #REMOTES do remotes_tail[#remotes_tail+1] = REMOTES[i] end
+    local console_tail = {}
+    for i = math.max(1, #CONSOLE - 12), #CONSOLE do console_tail[#console_tail+1] = CONSOLE[i] end
 
     -- write to rolling log
     local block = {
@@ -238,6 +250,8 @@ local function report_fail(kind_str, snapshot)
         "last trade remotes:",
     }
     for _, r in ipairs(remotes_tail) do block[#block+1] = "  " .. r end
+    block[#block+1] = "last console messages:"
+    for _, line in ipairs(console_tail) do block[#block+1] = "  " .. line end
     block[#block+1] = ""
     local text = table.concat(block, "\n")
 
@@ -276,6 +290,7 @@ local function report_fail(kind_str, snapshot)
                     fld("My offer", my_lines),
                     fld("Partner offer", partner_lines),
                     fld("Last trade remotes", (#remotes_tail>0 and remotes_tail or {"(none)"})),
+                    fld("Last console messages", (#console_tail>0 and console_tail or {"(none)"})),
                 },
                 footer = { text = LocalPlayer.Name },
             }},
@@ -308,6 +323,16 @@ end
 log("running - watching trades for", LocalPlayer.Name)
 local was_open = false
 local pending_close, pending_close_time = nil, 0
+local last_flush = 0
+local function flush_debug_log()
+    if not _writefile then return end
+    local lines = { "=== ADM TradeLog live debug | " .. LocalPlayer.Name .. " | " .. os.date("%Y-%m-%d %H:%M:%S") .. " ===", "", "-- TRADE REMOTES --" }
+    for _, line in ipairs(REMOTES) do lines[#lines+1] = line end
+    lines[#lines+1] = ""
+    lines[#lines+1] = "-- CONSOLE --"
+    for _, line in ipairs(CONSOLE) do lines[#lines+1] = line end
+    _writefile(DEBUG_FILE, table.concat(lines, "\n"))
+end
 while true do
     -- Failure UI often appears in PlayerGui only after the trade state closes.
     scan_gui_for_fail()
@@ -349,6 +374,11 @@ while true do
                 end
             end
         end
+    end
+
+    if os.clock() - last_flush >= CONFIG.FLUSH then
+        pcall(flush_debug_log)
+        last_flush = os.clock()
     end
 
     task.wait(CONFIG.POLL)

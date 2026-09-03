@@ -4,6 +4,7 @@
 *_blackbox.log
 *_crash.json
 *_tradefails.log
+*_tradelog_debug.log
 
 # local secrets — keep your real webhook URL out of the repo
 secrets.lua

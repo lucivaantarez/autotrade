@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 
 const message = 'The trade unexpectedly failed';
 const hints = ['the trade unexpectedly failed', 'unexpectedly failed', 'trade failed', 'could not be completed', 'cancelled the trade', 'declined'];
@@ -13,5 +14,8 @@ const payload = {
   failureReason: message,
 };
 for (const field of ['source', 'deviceId', 'account', 'timestamp', 'eventType', 'failureReason']) assert(payload[field]);
+
+const source = readFileSync(new URL('./adm_tradelog.lua', import.meta.url), 'utf8');
+for (const expected of ['PlayerGui', '_tradelog_debug.log', 'LogService.MessageOut', 'TRADE_FAILURE_DETECTED', 'WEBHOOK_RESPONSE:']) assert(source.includes(expected));
 
 console.log('Trade failure detection and payload simulation passed.');
