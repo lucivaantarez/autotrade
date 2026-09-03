@@ -39,7 +39,8 @@ local CONFIG = {
 
     BUFFER = 40,     -- recent trade-remote lines to keep
     POLL   = 0.4,    -- state poll interval (match the autotrade)
-    DEBUG  = false,
+    FAILURE_GRACE = 2, -- allow the failure toast to appear after the trade closes
+    DEBUG  = true,     -- temporary notification-pipeline tracing
 }
 
 --[[=====================================================================
@@ -52,6 +53,7 @@ local LocalPlayer = Players.LocalPlayer
 local HttpService = game:GetService("HttpService")
 local LogService  = game:GetService("LogService")
 local CoreGui     = game:GetService("CoreGui")
+local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
 
 local function log(...) if CONFIG.DEBUG then print("[tradelog]", ...) end end
 
@@ -147,28 +149,39 @@ end
     so the report says WHY, not just THAT it failed.
 --------------------------------------------------------------------]]
 local last_error_text, last_error_time = nil, 0
-local FAIL_HINTS = { "unexpectedly failed", "Trade failed", "trade failed",
+local failure_visible = false
+local FAIL_HINTS = { "the trade unexpectedly failed", "unexpectedly failed", "trade failed",
                      "could not be completed", "cancelled the trade", "declined" }
-local function note_if_fail(text)
+local function note_if_fail(text, should_record)
+    text = tostring(text or "")
+    local lowered = text:lower()
     for _, h in ipairs(FAIL_HINTS) do
-        if text:find(h, 1, true) then
-            last_error_text = text:gsub("[\r\n]", " "):sub(1, 160)
-            last_error_time = os.clock()
-            return
+        if lowered:find(h, 1, true) then
+            if should_record ~= false then
+                last_error_text = text:gsub("[\r\n]", " "):sub(1, 160)
+                last_error_time = os.clock()
+                log("TRADE_FAILURE_DETECTED:", last_error_text)
+            end
+            return true
         end
     end
+    return false
 end
 pcall(function()
     LogService.MessageOut:Connect(function(msg) pcall(note_if_fail, msg) end)
 end)
-local function scan_coregui_for_fail()
-    pcall(function()
-        for _, d in ipairs(CoreGui:GetDescendants()) do
-            if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Text and d.Text ~= "" then
-                note_if_fail(d.Text)
+local function scan_gui_for_fail()
+    local found = false
+    for _, root in ipairs({ CoreGui, PlayerGui }) do
+        pcall(function()
+            for _, d in ipairs(root:GetDescendants()) do
+                if (d:IsA("TextLabel") or d:IsA("TextButton")) and d.Text and d.Text ~= "" then
+                    if note_if_fail(d.Text, not found and not failure_visible) then found = true end
+                end
             end
-        end
-    end)
+        end)
+    end
+    failure_visible = found
 end
 
 --[[--------------------------------------------------------------------
@@ -204,21 +217,21 @@ local function take_snapshot(app, state)
 end
 
 local fail_count = 0
-local function report_fail(kind_str)
+local function report_fail(kind_str, snapshot)
     fail_count = fail_count + 1
     local err = (last_error_text and (os.clock() - last_error_time) < 8) and last_error_text or nil
 
-    local my_lines      = summarize(snap.my_items)
-    local partner_lines = summarize(snap.partner_items)
+    local my_lines      = summarize(snapshot.my_items)
+    local partner_lines = summarize(snapshot.partner_items)
     local remotes_tail  = {}
     for i = math.max(1, #REMOTES - 12), #REMOTES do remotes_tail[#remotes_tail+1] = REMOTES[i] end
 
     -- write to rolling log
     local block = {
         "==== TRADE " .. kind_str .. " #" .. fail_count .. "  @" .. os.date("%H:%M:%S") .. " ====",
-        "partner: " .. (snap.partner_name or "?"),
-        "died at stage: " .. tostring(snap.stage),
-        "confirmed?  me=" .. tostring(snap.my_confirmed) .. "  partner=" .. tostring(snap.partner_confirmed),
+        "partner: " .. (snapshot.partner_name or "?"),
+        "died at stage: " .. tostring(snapshot.stage),
+        "confirmed?  me=" .. tostring(snapshot.my_confirmed) .. "  partner=" .. tostring(snapshot.partner_confirmed),
         "game said: " .. (err or "(no error text captured)"),
         "my offer:      " .. table.concat(my_lines, ", "),
         "partner offer: " .. table.concat(partner_lines, ", "),
@@ -238,21 +251,28 @@ local function report_fail(kind_str)
 
     -- webhook
     if CONFIG.WEBHOOK.enabled and CONFIG.WEBHOOK.url ~= "" and _request then
+        log("CREATING_LOG_PAYLOAD")
         local function fld(name, lines, inline)
             local v = "```\n" .. table.concat(lines, "\n") .. "\n```"
             if #v > 1000 then v = v:sub(1, 990) .. "\n...```" end
             return { name = name, value = v, inline = inline or false }
         end
         local payload = {
+            source = "adm_tradelog",
+            deviceId = (getgenv and getgenv().SATURNITY_DEVICE_ID) or LocalPlayer.Name,
+            account = LocalPlayer.Name,
+            timestamp = os.time(),
+            eventType = "TRADE_FAILURE",
+            failureReason = err or "Trade closed without both sides confirmed",
             username = "ADM TradeLog",
             embeds = {{
                 title = "Trade " .. kind_str,
                 description = err and ("Game said: **" .. err .. "**") or "closed without completing",
                 color = (kind_str == "FAILED") and 15548997 or 15844367,
                 fields = {
-                    { name = "Partner", value = snap.partner_name or "?", inline = true },
-                    { name = "Died at", value = tostring(snap.stage), inline = true },
-                    { name = "Confirmed", value = "me=" .. tostring(snap.my_confirmed) .. " / partner=" .. tostring(snap.partner_confirmed), inline = true },
+                    { name = "Partner", value = snapshot.partner_name or "?", inline = true },
+                    { name = "Died at", value = tostring(snapshot.stage), inline = true },
+                    { name = "Confirmed", value = "me=" .. tostring(snapshot.my_confirmed) .. " / partner=" .. tostring(snapshot.partner_confirmed), inline = true },
                     fld("My offer", my_lines),
                     fld("Partner offer", partner_lines),
                     fld("Last trade remotes", (#remotes_tail>0 and remotes_tail or {"(none)"})),
@@ -262,13 +282,23 @@ local function report_fail(kind_str)
         }
         local ok, body = pcall(function() return HttpService:JSONEncode(payload) end)
         if ok then
-            pcall(function()
+            log("SENDING_TO_WEBHOOK")
+            local sent, response = pcall(function()
                 local headers = { ["Content-Type"] = "application/json" }
                 if CONFIG.WEBHOOK.token ~= "" then headers.Authorization = "Bearer " .. CONFIG.WEBHOOK.token end
-                _request({ Url = CONFIG.WEBHOOK.url, Method = "POST",
-                           Headers = headers, Body = body })
+                return _request({ Url = CONFIG.WEBHOOK.url, Method = "POST",
+                                  Headers = headers, Body = body })
             end)
+            if sent then
+                log("WEBHOOK_RESPONSE:", response and (response.StatusCode or response.Status or response.status_code) or "unknown")
+            else
+                log("WEBHOOK_RESPONSE: ERROR", response)
+            end
+        else
+            log("PAYLOAD_CREATION_ERROR:", body)
         end
+    else
+        log("WEBHOOK_SKIPPED:", "enabled=" .. tostring(CONFIG.WEBHOOK.enabled), "request=" .. tostring(_request ~= nil), "url=" .. tostring(CONFIG.WEBHOOK.url ~= ""))
     end
 end
 
@@ -277,7 +307,11 @@ end
 --------------------------------------------------------------------]]
 log("running - watching trades for", LocalPlayer.Name)
 local was_open = false
+local pending_close, pending_close_time = nil, 0
 while true do
+    -- Failure UI often appears in PlayerGui only after the trade state closes.
+    scan_gui_for_fail()
+
     local app = get_trade_app()
     local state = nil
     if app then
@@ -289,27 +323,32 @@ while true do
         -- trade is open: keep a fresh snapshot every tick
         snap = take_snapshot(app, state)
         was_open = true
-        scan_coregui_for_fail()  -- catch the error toast while still open
     elseif was_open then
-        -- just closed. classify using the LAST snapshot we took.
+        -- Keep the final snapshot briefly because the failure toast is asynchronous.
         was_open = false
-        if snap then
-            local completed = (snap.stage == "confirmation") and snap.my_confirmed and snap.partner_confirmed
+        pending_close, pending_close_time = snap, os.clock()
+        snap = nil
+    end
+
+    if pending_close and ((last_error_time >= pending_close_time) or (os.clock() - pending_close_time >= CONFIG.FAILURE_GRACE)) then
+        local snapshot = pending_close
+        pending_close = nil
+        if snapshot then
+            local completed = (snapshot.stage == "confirmation") and snapshot.my_confirmed and snapshot.partner_confirmed
             if completed then
                 log("trade completed cleanly - not logging")
             else
                 -- fail vs cancel: fail if the game printed an error recently
                 local had_err = last_error_text and (os.clock() - last_error_time) < 8
                 if had_err then
-                    report_fail("FAILED")
+                    report_fail("FAILED", snapshot)
                 elseif CONFIG.LOG_CANCELS then
-                    report_fail("CANCELLED")
+                    report_fail("CANCELLED", snapshot)
                 else
                     log("closed without confirm, no error text - skipping (LOG_CANCELS off)")
                 end
             end
         end
-        snap = nil
     end
 
     task.wait(CONFIG.POLL)
