@@ -84,6 +84,10 @@ getgenv().Utility = getgenv().Utility or {
             TradeRequests = true,
             GiveItemRequests = true,
         },
+        Webhook = {
+            Enabled = true,
+            Url = "", -- keep empty in GitHub; pass WINTERHUB_WEBHOOK_URL at runtime
+        },
         Debug = false,
     },
 }
@@ -132,6 +136,8 @@ local last_items = {}
 local last_activity = os.clock()
 local in_trade = false
 local last_write = -CONFIG.Heartbeat
+local request = (syn and syn.request) or (http and http.request) or http_request or request
+local webhook_url = (getgenv and getgenv().WINTERHUB_WEBHOOK_URL) or (CONFIG.Webhook and CONFIG.Webhook.Url) or ""
 
 local Fsys = require(game.ReplicatedStorage:WaitForChild("Fsys"))
 local UIManager, KindDB
@@ -181,6 +187,26 @@ local function summarize(items)
     return result
 end
 
+local function send_trade_webhook(items)
+    if not request or webhook_url == "" or (CONFIG.Webhook and CONFIG.Webhook.Enabled == false) then return end
+    local lines = {}
+    for _, item in ipairs(items) do lines[#lines + 1] = string.format("%dx %s", item.qty, item.name) end
+    local body = HttpService:JSONEncode({
+        username = "ZekeHub WinterHub",
+        embeds = {{
+            title = "Trade complete",
+            description = #lines > 0 and table.concat(lines, "\n") or "No received items",
+            color = 5763719,
+            footer = { text = LocalPlayer.Name },
+            timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        }},
+    })
+    local ok, response = pcall(function()
+        return request({ Url = webhook_url, Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = body })
+    end)
+    log("webhook", ok and response and (response.StatusCode or response.Status) or response)
+end
+
 local function write_status()
     if os.clock() - last_write < CONFIG.Heartbeat then return end
     last_write = os.clock()
@@ -226,6 +252,7 @@ task.spawn(function()
                 if completed then
                     trade_count = trade_count + 1
                     last_items = summarize(received)
+                    send_trade_webhook(last_items)
                     log("trade completed", trade_count)
                 end
                 completed, received = false, nil
