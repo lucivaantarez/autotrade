@@ -46,7 +46,9 @@ local CONFIG = {
         poll = 0.4,
         -- How often it re-taps Accept/Confirm while waiting out the trade
         -- lock timer, in seconds. Don't set this too low.
-        refire_every = 1.0,
+        refire_every = 3.0,
+        negotiation_delay = 1.0,
+        confirmation_delay = 3.0,
     },
 
     WINTERHUB = {
@@ -342,13 +344,17 @@ end
 
 local app_cache = nil
 local function get_trade_app()
-    if app_cache then return app_cache end
     local ok, app = pcall(function() return UIManager.apps.TradeApp end)
-    if ok and app then app_cache = app patch_trade_app(app) return app end
+    if ok and app then
+        if app ~= app_cache then app_cache = app patch_trade_app(app) end
+        return app
+    end
+    app_cache = nil
     return nil
 end
 
-local last_stage, last_fire = nil, 0
+local last_stage, last_fire, stage_since = nil, 0, 0
+local action_busy, confirmation_fired = false, false
 local in_trade = false
 -- completion tracking for the webhook + WinterHub
 local completing = false
@@ -386,7 +392,8 @@ local function step_trade()
     if stage ~= last_stage then
         log("stage:", stage)
         last_stage = stage
-        last_fire = 0
+        stage_since = os.clock()
+        confirmation_fired = false
     end
 
     -- detect real completion: both sides confirmed (cache items before close)
@@ -403,14 +410,28 @@ local function step_trade()
         end
     end
 
+    local delay = stage == "confirmation" and CONFIG.AUTO_ACCEPT.confirmation_delay or CONFIG.AUTO_ACCEPT.negotiation_delay
+    if os.clock() - stage_since < delay then return end
     if os.clock() - last_fire < CONFIG.AUTO_ACCEPT.refire_every then return end
+    if action_busy or (stage == "confirmation" and confirmation_fired) then return end
+
+    -- Re-read both the app instance and stage immediately before acting.
+    local current_app = get_trade_app()
+    local current_state = current_app and current_app:_get_local_trade_state()
+    if current_app ~= app or not current_state or current_state.current_stage ~= stage then return end
+
+    action_busy = true
     last_fire = os.clock()
 
     if stage == "negotiation" then
-        pcall(function() app:_on_accept_pressed() end)
+        local ok, err = pcall(function() current_app:_on_accept_pressed() end)
+        if not ok then log("accept error:", err) end
     elseif stage == "confirmation" then
-        pcall(function() app:_on_confirm_pressed() end)
+        confirmation_fired = true
+        local ok, err = pcall(function() current_app:_on_confirm_pressed() end)
+        if not ok then log("confirm error:", err) confirmation_fired = false end
     end
+    action_busy = false
 end
 
 --[[=====================================================================

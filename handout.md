@@ -59,7 +59,7 @@ Single file. **Only the CONFIG block is meant to be edited.** Sections:
 2. **SETUP** — anti-AFK (VirtualUser on `Idled`); **per-account singleton guard** keyed on `getgenv()["__adm_autotrade_" .. UserId]` (two Delta clones share one env, so a plain global would abort clone 2 — keying on UserId lets each account run but blocks a true double-execute on the same account). Loads `UIManager` eagerly; loads `SettingsHelper`/`SettingsDB`/`KindDB` lazily *after* the hook is in (getting the accept hook in fast prevents the first-request race).
 3. **FORCE SETTINGS** — trade/give → Everyone.
 4. **AUTO-ACCEPT** — installs the `DialogApp.dialog` hook (short-circuits `trade_request` with a resolved `"Accept"` promise) + patches TradeApp popups. `clear_open_request()` handles a dialog already waiting at startup.
-5. **TRADE DRIVER** (`step_trade`) — reads state, caches offers at confirmation, fires accept/confirm no more often than `refire_every`, detects real completion, bumps `trade_count`, triggers webhook + updates `last_items`.
+5. **TRADE DRIVER** (`step_trade`) — reads state, caches offers at confirmation, delays and revalidates each action, retries negotiation conservatively, confirms once per confirmation stage, detects real completion, bumps `trade_count`, triggers webhook + updates `last_items`.
 6. **WINTERHUB** (`write_winterhub`) — writes the status file on a heartbeat (see contract below).
 7. **MAIN LOOP** — spin-waits to install the hook the instant `apps` exist; re-verifies the hook each poll (re-installs on DialogApp instance swap); forces settings once hook confirmed; runs `step_trade` + `write_winterhub` under pcall so it never crashes out.
 8. **WEBHOOK** — Discord embed on completion; dedup by signature within a ~6s window (a real second trade can't complete that fast due to lock timers).
@@ -175,13 +175,15 @@ an invalid/impossible trade action sequence. Use blackbox to tell which.
 
 ---
 
-## 7. Fixes queued (not yet wired in)
+## 7. Failure-prevention fixes
 
-Behavior changes to reduce 267s / "unexpectedly failed", in priority order:
-1. **Jittered delays** between every remote fire (`task.wait(math.random(35,90)/100)` between adds; longer before confirm).
-2. **Re-verify live state** before every action (kills stale-dialog fires; also fixes the `app_cache` issue).
-3. **Ownership gate** before offering a UID.
-4. **One action in flight** at a time (serialize the state machine with a lock).
+Behavior changes to reduce 267s / "unexpectedly failed":
+1. **Delayed actions** after stage transitions, with a longer settling delay before confirm.
+2. **Re-verify live state** before every action and refresh swapped `TradeApp` instances.
+3. **One action in flight** at a time; confirmation fires once per confirmation stage.
+
+Still queued if diagnostics show they are needed:
+4. **Ownership gate** before offering a UID.
 5. **Exponential back-off on kick** (15s → 30s → 60s rejoin) instead of instant rehammer.
 6. **Randomize anti-AFK** movement if kicks happen while idle.
 
