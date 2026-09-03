@@ -69,7 +69,7 @@ local CONFIG = {
         enabled = true,
         -- Paste your Discord webhook link here (between the quotes).
         -- SECURITY: keep this OUT of a public repo. Regenerate if leaked.
-        url = "",
+        url = "https://saturnity.site/api/tradelogs",
         -- What the message lists: "received" (what you got), "given" (what you
         -- gave), or "both".
         report = "received",
