@@ -25,7 +25,8 @@ local CONFIG = {
 
     WEBHOOK = {
         enabled = true,
-        url = "",   -- paste a Discord webhook (can reuse the autotrade one)
+        url = "https://saturnity.site/api/tradelog",
+        token = (getgenv and getgenv().SATURNITY_TRADELOG_TOKEN) or "",
     },
 
     -- Log NORMAL cancels too (you/partner closed the window with nothing
@@ -262,8 +263,10 @@ local function report_fail(kind_str)
         local ok, body = pcall(function() return HttpService:JSONEncode(payload) end)
         if ok then
             pcall(function()
+                local headers = { ["Content-Type"] = "application/json" }
+                if CONFIG.WEBHOOK.token ~= "" then headers.Authorization = "Bearer " .. CONFIG.WEBHOOK.token end
                 _request({ Url = CONFIG.WEBHOOK.url, Method = "POST",
-                           Headers = { ["Content-Type"] = "application/json" }, Body = body })
+                           Headers = headers, Body = body })
             end)
         end
     end
