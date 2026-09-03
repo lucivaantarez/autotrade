@@ -1,5 +1,96 @@
--- WinterHub contract wrapper for ZekeHub Utility.
--- Set getgenv().Utility and getgenv().scriptkey before loading this file.
+-- ZekeHub Utility + WinterHub contract wrapper.
+-- Paste your private key below in a LOCAL copy. Never commit the real key.
+
+getgenv().scriptkey = getgenv().scriptkey or "" -- <-- PASTE YOUR ZEKEHUB KEY BETWEEN THESE QUOTES
+
+getgenv().Utility = getgenv().Utility or {
+    AutoPotion = {
+        Enabled = false,
+        UseAllOnAll = false,
+        SelectedPets = {},
+    },
+    AutoNeon = {
+        Enabled = false,
+        MakeMega = false,
+        SelectedPets = {},
+    },
+    AutoTrade = {
+        Enabled = true,
+        Debug = false,
+        AutoAcceptTrades = true,
+        AutoLeaveAfterTrades = false, -- WinterHub owns server hopping
+        LeaveDelay = 5,
+        Usernames = {},
+        TradeMode = "all",
+        Categories = { "pets", "toys", "food", "transport", "gifts", "stickers", "pet_accessories" },
+        Items = {},
+        ItemCounts = {},
+        BlacklistedRarities = {},
+        GlobalPetFilter = {
+            Versions = {},
+            Ages = {},
+        },
+        PetFilters = {
+            -- dog = { regular = { 6 }, neon = {} },
+        },
+        Filters = {
+            Kind = "ALL",
+            Type = "ALL",
+            Rarity = "ALL",
+            Search = "",
+        },
+    },
+    AutoOpen = {
+        Enabled = false,
+        Items = {},
+        OpenDelay = 1,
+    },
+    Shop = {
+        Enabled = false,
+        Items = {},
+        BuyQuantity = 1,
+        BuyDelay = 1,
+    },
+    AccountManager = {
+        Enabled = false, -- WinterHub owns account rotation
+        Tool = "none",
+        FarmSync = {
+            Action = "completed",
+            FromFolderId = "",
+            ToFolderId = "",
+            ChangeWithoutReplacement = false,
+            ConfigId = nil,
+            ApiKey = "",
+        },
+        FarmerV5 = {
+            ApiKey = "",
+            Action = "swap",
+            Option = 1,
+        },
+    },
+    Settings = {
+        AutoShowUI = true,
+        Theme = "Dark",
+        ToggleKey = "RightShift",
+        UIScale = "auto",
+    },
+    WinterHub = {
+        Enabled = true,
+        Heartbeat = 5,
+        Poll = 0.4,
+        IdleHopSeconds = 12,
+        ForceSettings = {
+            Enabled = true,
+            TradeRequests = true,
+            GiveItemRequests = true,
+        },
+        Debug = false,
+    },
+}
+
+if getgenv().scriptkey == "" then
+    error("Paste your ZekeHub key into getgenv().scriptkey before running this script")
+end
 
 local utility = (getgenv and getgenv().Utility) or {}
 local CONFIG = utility.WinterHub or {
