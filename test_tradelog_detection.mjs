@@ -16,6 +16,6 @@ const payload = {
 for (const field of ['source', 'deviceId', 'account', 'timestamp', 'eventType', 'failureReason']) assert(payload[field]);
 
 const source = readFileSync(new URL('./adm_tradelog.lua', import.meta.url), 'utf8');
-for (const expected of ['PlayerGui', '_tradelog_debug.log', 'LogService.MessageOut', 'TRADE_FAILURE_DETECTED', 'WEBHOOK_RESPONSE:']) assert(source.includes(expected));
+for (const expected of ['PlayerGui', '_tradelog_debug.log', 'LogService.MessageOut', 'TRADE_FAILURE_DETECTED', 'WEBHOOK_RESPONSE:', 'LOG_CANCELS = true', 'UIManager = load("UIManager")']) assert(source.includes(expected));
 
 console.log('Trade failure detection and payload simulation passed.');

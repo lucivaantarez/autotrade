@@ -31,7 +31,7 @@ local CONFIG = {
 
     -- Log NORMAL cancels too (you/partner closed the window with nothing
     -- confirmed). false = only log real FAILURES (server reject / error text).
-    LOG_CANCELS = false,
+    LOG_CANCELS = true, -- preserve every incomplete close even if the UI toast is missed
 
     -- Record recent trade remotes (AddItemToOffer, accept, confirm...) so the
     -- report shows the exact last actions before the fail.
@@ -41,7 +41,7 @@ local CONFIG = {
     POLL   = 0.4,    -- state poll interval (match the autotrade)
     FLUSH  = 2,      -- continuously refresh the workspace debug log
     FAILURE_GRACE = 2, -- allow the failure toast to appear after the trade closes
-    DEBUG  = false,
+    DEBUG  = true,
 }
 
 --[[=====================================================================
@@ -199,6 +199,10 @@ end
 --------------------------------------------------------------------]]
 local app_cache
 local function get_trade_app()
+    if not UIManager then
+        pcall(function() UIManager = load("UIManager") end)
+    end
+    if not UIManager then return nil end
     -- re-fetch if the cached app is stale/gone (avoids the app_cache bug)
     local ok, app = pcall(function() return UIManager.apps.TradeApp end)
     if ok and app then
