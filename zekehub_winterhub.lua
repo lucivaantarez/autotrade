@@ -69,7 +69,7 @@ getgenv().Utility = getgenv().Utility or {
         },
     },
     Settings = {
-        AutoShowUI = true,
+        AutoShowUI = false,
         Theme = "Dark",
         ToggleKey = "RightShift",
         UIScale = "auto",
