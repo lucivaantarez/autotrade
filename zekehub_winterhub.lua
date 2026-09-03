@@ -1,13 +1,24 @@
 -- WinterHub contract wrapper for ZekeHub Utility.
 -- Set getgenv().Utility and getgenv().scriptkey before loading this file.
 
-local CONFIG = {
-    heartbeat = 5,
-    poll = 0.4,
-    idle_hop_seconds = 12,
-    zekehub_url = "https://zekehub.com/scripts/AdoptMe/Utility.lua",
-    debug = false,
+local utility = (getgenv and getgenv().Utility) or {}
+local CONFIG = utility.WinterHub or {
+    Enabled = true,
+    Heartbeat = 5,
+    Poll = 0.4,
+    IdleHopSeconds = 12,
+    ForceSettings = {
+        Enabled = true,
+        TradeRequests = true,
+        GiveItemRequests = true,
+    },
+    Debug = false,
 }
+local ZEKEHUB_URL = "https://zekehub.com/scripts/AdoptMe/Utility.lua"
+
+if not CONFIG.Enabled then
+    return loadstring(game:HttpGet(ZEKEHUB_URL))()
+end
 
 local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
@@ -22,14 +33,14 @@ end
 if getgenv then getgenv()[guard_key] = true end
 
 local function log(...)
-    if CONFIG.debug then print("[zekehub/winterhub]", ...) end
+    if CONFIG.Debug then print("[zekehub/winterhub]", ...) end
 end
 
 local trade_count = 0
 local last_items = {}
 local last_activity = os.clock()
 local in_trade = false
-local last_write = -CONFIG.heartbeat
+local last_write = -CONFIG.Heartbeat
 
 local Fsys = require(game.ReplicatedStorage:WaitForChild("Fsys"))
 local UIManager, KindDB
@@ -42,6 +53,28 @@ local function trade_app()
     if not UIManager then UIManager = game_module("UIManager") end
     return UIManager and UIManager.apps and UIManager.apps.TradeApp or nil
 end
+
+local function force_everyone(setting_id)
+    local helper = game_module("SettingsHelper")
+    local ok, database = pcall(function() return require(game.ReplicatedStorage.ClientDB.SettingsDB) end)
+    local definition = ok and database and database.by_id[setting_id]
+    local choices = definition and definition.element_options and definition.element_options.choices
+    local everyone = choices and table.find(choices, "Everyone")
+    if not helper or not everyone then return false end
+    return pcall(function() helper.set_setting_client({ setting_id = setting_id, value = everyone }) end)
+end
+
+task.spawn(function()
+    local settings = CONFIG.ForceSettings or {}
+    if not settings.Enabled then return end
+    for _ = 1, 30 do
+        local trade_ok = not settings.TradeRequests or force_everyone("trade_requests")
+        local give_ok = not settings.GiveItemRequests or force_everyone("give_item_requests")
+        if trade_ok and give_ok then log("trade settings forced to Everyone") return end
+        task.wait(1)
+    end
+    warn("[zekehub/winterhub] could not force trade settings after 30 seconds")
+end)
 
 local function summarize(items)
     if not KindDB then KindDB = game_module("KindDB") end
@@ -58,10 +91,10 @@ local function summarize(items)
 end
 
 local function write_status()
-    if os.clock() - last_write < CONFIG.heartbeat then return end
+    if os.clock() - last_write < CONFIG.Heartbeat then return end
     last_write = os.clock()
     local status = "active"
-    if not in_trade and os.clock() - last_activity > CONFIG.idle_hop_seconds then
+    if not in_trade and os.clock() - last_activity > CONFIG.IdleHopSeconds then
         status = "completed"
     end
     writefile(status_file, HttpService:JSONEncode({
@@ -111,10 +144,10 @@ task.spawn(function()
 
             write_status()
         end)
-        task.wait(CONFIG.poll)
+        task.wait(CONFIG.Poll)
     end
 end)
 
-local loader = loadstring(game:HttpGet(CONFIG.zekehub_url))
+local loader = loadstring(game:HttpGet(ZEKEHUB_URL))
 if not loader then error("ZekeHub Utility failed to compile") end
 return loader()
