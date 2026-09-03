@@ -77,8 +77,9 @@ getgenv().Utility = getgenv().Utility or {
     WinterHub = {
         Enabled = true,
         Heartbeat = 5,
-        Poll = 0.4,
+        Poll = 0.1,
         IdleHopSeconds = 12,
+        StartupGrace = 45,
         ForceSettings = {
             Enabled = true,
             TradeRequests = true,
@@ -97,18 +98,24 @@ if getgenv().scriptkey == "" then
 end
 
 local utility = (getgenv and getgenv().Utility) or {}
-local CONFIG = utility.WinterHub or {
-    Enabled = true,
-    Heartbeat = 5,
-    Poll = 0.4,
-    IdleHopSeconds = 12,
-    ForceSettings = {
-        Enabled = true,
-        TradeRequests = true,
-        GiveItemRequests = true,
-    },
-    Debug = false,
-}
+local CONFIG = type(utility.WinterHub) == "table" and utility.WinterHub or {}
+local function positive_number(value, fallback)
+    value = tonumber(value)
+    return value and value > 0 and value or fallback
+end
+if CONFIG.Enabled == nil then CONFIG.Enabled = true end
+CONFIG.Heartbeat = positive_number(CONFIG.Heartbeat, 5)
+CONFIG.Poll = positive_number(CONFIG.Poll, 0.1)
+CONFIG.IdleHopSeconds = positive_number(CONFIG.IdleHopSeconds, 12)
+CONFIG.StartupGrace = positive_number(CONFIG.StartupGrace, 45)
+CONFIG.ForceSettings = type(CONFIG.ForceSettings) == "table" and CONFIG.ForceSettings or {}
+if CONFIG.ForceSettings.Enabled == nil then CONFIG.ForceSettings.Enabled = true end
+if CONFIG.ForceSettings.TradeRequests == nil then CONFIG.ForceSettings.TradeRequests = true end
+if CONFIG.ForceSettings.GiveItemRequests == nil then CONFIG.ForceSettings.GiveItemRequests = true end
+CONFIG.Webhook = type(CONFIG.Webhook) == "table" and CONFIG.Webhook or {}
+if CONFIG.Webhook.Enabled == nil then CONFIG.Webhook.Enabled = true end
+CONFIG.Webhook.Url = CONFIG.Webhook.Url or ""
+if CONFIG.Debug == nil then CONFIG.Debug = false end
 local ZEKEHUB_URL = "https://zekehub.com/scripts/AdoptMe/Utility.lua"
 
 if not CONFIG.Enabled then
@@ -136,7 +143,10 @@ local last_items = {}
 local last_activity = os.clock()
 local in_trade = false
 local last_write = -CONFIG.Heartbeat
-local request = (syn and syn.request) or (http and http.request) or http_request or request
+local started_at = os.clock()
+local has_seen_trade = false
+local fatal_error = nil
+local request_fn = (syn and syn.request) or (http and http.request) or http_request or request
 local webhook_url = (getgenv and getgenv().WINTERHUB_WEBHOOK_URL) or (CONFIG.Webhook and CONFIG.Webhook.Url) or ""
 
 local Fsys = require(game.ReplicatedStorage:WaitForChild("Fsys"))
@@ -188,7 +198,7 @@ local function summarize(items)
 end
 
 local function send_trade_webhook(items)
-    if not request or webhook_url == "" or (CONFIG.Webhook and CONFIG.Webhook.Enabled == false) then return end
+    if not request_fn or webhook_url == "" or CONFIG.Webhook.Enabled == false then return end
     local lines = {}
     for _, item in ipairs(items) do lines[#lines + 1] = string.format("%dx %s", item.qty, item.name) end
     local body = HttpService:JSONEncode({
@@ -202,7 +212,7 @@ local function send_trade_webhook(items)
         }},
     })
     local ok, response = pcall(function()
-        return request({ Url = webhook_url, Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = body })
+        return request_fn({ Url = webhook_url, Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = body })
     end)
     log("webhook", ok and response and (response.StatusCode or response.Status) or response)
 end
@@ -210,8 +220,9 @@ end
 local function write_status()
     if os.clock() - last_write < CONFIG.Heartbeat then return end
     last_write = os.clock()
-    local status = "active"
-    if not in_trade and os.clock() - last_activity > CONFIG.IdleHopSeconds then
+    local status = fatal_error and "error" or "active"
+    local startup_ready = has_seen_trade or os.clock() - started_at >= CONFIG.StartupGrace
+    if not fatal_error and startup_ready and not in_trade and os.clock() - last_activity > CONFIG.IdleHopSeconds then
         status = "completed"
     end
     writefile(status_file, HttpService:JSONEncode({
@@ -228,13 +239,14 @@ task.spawn(function()
     local completed, received = false, nil
 
     while true do
-        pcall(function()
+        local state_ok, state_error = pcall(function()
             local app = trade_app()
             local state = app and app:_get_local_trade_state() or nil
 
             if state then
                 in_trade = true
                 was_open = true
+                has_seen_trade = true
                 last_activity = os.clock()
 
                 if state.current_stage == "confirmation" then
@@ -246,26 +258,51 @@ task.spawn(function()
                     end
                 end
             elseif was_open then
+                -- Some clients clear state between polls; offers can remain readable
+                -- for this close tick, so take one final completion snapshot.
+                pcall(function()
+                    local mine = app and app:_get_my_offer()
+                    local partner = app and app:_get_partner_offer()
+                    if mine and partner and mine.confirmed and partner.confirmed then
+                        completed = true
+                        received = partner.items
+                    end
+                end)
                 in_trade = false
                 was_open = false
                 last_activity = os.clock()
                 if completed then
                     trade_count = trade_count + 1
                     last_items = summarize(received)
-                    send_trade_webhook(last_items)
+                    task.spawn(send_trade_webhook, last_items)
                     log("trade completed", trade_count)
                 end
                 completed, received = false, nil
             else
                 in_trade = false
             end
-
-            write_status()
         end)
+        if not state_ok then log("trade-state error", state_error) end
+        local write_ok, write_error = pcall(write_status)
+        if not write_ok then warn("[zekehub/winterhub] heartbeat write failed: " .. tostring(write_error)) end
         task.wait(CONFIG.Poll)
     end
 end)
 
-local loader = loadstring(game:HttpGet(ZEKEHUB_URL))
-if not loader then error("ZekeHub Utility failed to compile") end
-return loader()
+local fetched, source = pcall(function() return game:HttpGet(ZEKEHUB_URL) end)
+local loader, compile_error = fetched and loadstring(source) or nil, nil
+if fetched and not loader then compile_error = "ZekeHub Utility failed to compile" end
+if not loader then
+    fatal_error = tostring(fetched and compile_error or source)
+    last_write = -CONFIG.Heartbeat
+    pcall(write_status)
+    error(fatal_error)
+end
+local ok, result = pcall(loader)
+if not ok then
+    fatal_error = tostring(result)
+    last_write = -CONFIG.Heartbeat
+    pcall(write_status)
+    error(result)
+end
+return result
