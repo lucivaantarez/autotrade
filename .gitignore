@@ -1,0 +1,10 @@
+# runtime output written by the scripts on the device (never commit)
+*_winteraddons.json
+*_winterswap.json
+*_blackbox.log
+*_crash.json
+*_tradefails.log
+
+# local secrets — keep your real webhook URL out of the repo
+secrets.lua
+*.local
