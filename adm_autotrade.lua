@@ -93,15 +93,6 @@ end
 local Players     = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
 
--- ANTI-AFK: stop Roblox's 20-min idle kick. Fires VirtualUser on Idled.
-pcall(function()
-    local VirtualUser = game:GetService("VirtualUser")
-    LocalPlayer.Idled:Connect(function()
-        VirtualUser:CaptureController()
-        VirtualUser:ClickButton2(Vector2.new())
-    end)
-end)
-
 -- SINGLETON GUARD (per-account): two clones share one Delta env + getgenv,
 -- so a single global flag would make clone 2 abort. Key it on UserId instead:
 -- each account gets its own slot, but a real double-execute on the SAME
@@ -115,25 +106,50 @@ if getgenv then
     getgenv()[_guard_key] = true
 end
 
-local Fsys = require(game.ReplicatedStorage:WaitForChild("Fsys"))
+-- ANTI-AFK: stop Roblox's 20-min idle kick. Install side effects only after
+-- the singleton guard so rejected duplicate executions add no listeners.
+pcall(function()
+    local VirtualUser = game:GetService("VirtualUser")
+    LocalPlayer.Idled:Connect(function()
+        VirtualUser:CaptureController()
+        VirtualUser:ClickButton2(Vector2.new())
+    end)
+end)
+
+local fsys_ok, Fsys = pcall(function()
+    return require(game.ReplicatedStorage:WaitForChild("Fsys"))
+end)
+if not fsys_ok or not Fsys then
+    if getgenv then getgenv()[_guard_key] = nil end
+    error("[autotrade] failed to load Fsys: " .. tostring(Fsys))
+end
 local load = Fsys.load
 
 -- Load ONLY UIManager eagerly - it's all the accept hook needs, and getting
 -- the hook in fast is what prevents the first-request race. Everything else
 -- (settings DB, KindDB) is loaded lazily AFTER the hook is in.
 local UIManager
-pcall(function() UIManager = load("UIManager") end)
+local function ensure_ui_manager()
+    if not UIManager then
+        pcall(function() UIManager = load("UIManager") end)
+    end
+    return UIManager
+end
+ensure_ui_manager()
 
 local SettingsHelper, SettingsDB, KindDB
-local deps_ready = false
 local function ensure_deps()
-    if deps_ready then return end
-    pcall(function()
-        SettingsHelper = load("SettingsHelper")
-        SettingsDB     = require(game.ReplicatedStorage.ClientDB.SettingsDB)
-        KindDB         = load("KindDB")   -- kind -> display name
-    end)
-    deps_ready = (SettingsDB ~= nil)
+    -- Load each dependency independently. A partial startup failure must not
+    -- permanently suppress retries for whichever module was still unavailable.
+    if not SettingsHelper then
+        pcall(function() SettingsHelper = load("SettingsHelper") end)
+    end
+    if not SettingsDB then
+        pcall(function() SettingsDB = require(game.ReplicatedStorage.ClientDB.SettingsDB) end)
+    end
+    if not KindDB then
+        pcall(function() KindDB = load("KindDB") end)   -- kind -> display name
+    end
 end
 
 -- idle state (declared early so the accept hook + driver can use it)
@@ -145,22 +161,32 @@ local function mark_activity() last_activity = os.clock() end
 =======================================================================]]
 local function force_everyone(id)
     ensure_deps()
-    pcall(function()
+    local changed = false
+    local ok = pcall(function()
+        if not SettingsHelper or not SettingsDB then return end
         local def = SettingsDB.by_id[id]
         if not def then return end
         local idx = table.find(def.element_options.choices, "Everyone")
         if not idx then return end
         SettingsHelper.set_setting_client({ setting_id = id, value = idx })
+        changed = true
         log("setting", id, "-> Everyone")
     end)
+    return ok and changed
 end
 
+local trade_setting_done = not CONFIG.FORCE_SETTINGS.enabled
+local giving_setting_done = not CONFIG.FORCE_SETTINGS.enabled
+    or not CONFIG.FORCE_SETTINGS.also_force_giving
 local function force_trade_settings()
-    if not CONFIG.FORCE_SETTINGS.enabled then return end
-    force_everyone("trade_requests")
-    if CONFIG.FORCE_SETTINGS.also_force_giving then
-        force_everyone("give_item_requests")
+    if not CONFIG.FORCE_SETTINGS.enabled then return true end
+    if not trade_setting_done then
+        trade_setting_done = force_everyone("trade_requests")
     end
+    if not giving_setting_done then
+        giving_setting_done = force_everyone("give_item_requests")
+    end
+    return trade_setting_done and giving_setting_done
 end
 
 --[[=====================================================================
@@ -189,16 +215,35 @@ local function patch_trade_app(app)
     log("trade warnings neutralized")
 end
 
+local hooked_dialog_class, hooked_dialog_fn
+local invite_guard_ready, exclusion_guard_ready = false, false
+local invite_guard_module, exclusion_guard_module
+local function allow_invites() return true end
+local function allow_player() return false end
 local function install_accept_hook()
     if not CONFIG.AUTO_ACCEPT.enabled then return false end
-    if not UIManager then return false end
+    if not ensure_ui_manager() then return false end
 
     local apps = UIManager.apps
     if not apps then return false end
 
     -- (a) don't let the game auto-decline before showing the dialog
-    pcall(function() load("MinigameForcedState").can_receive_invites = function() return true end end)
-    pcall(function() load("TradeExcluder").is_player_excluded = function() return false end end)
+    if not invite_guard_ready or not invite_guard_module
+        or invite_guard_module.can_receive_invites ~= allow_invites then
+        pcall(function()
+            invite_guard_module = load("MinigameForcedState")
+            invite_guard_module.can_receive_invites = allow_invites
+            invite_guard_ready = invite_guard_module.can_receive_invites == allow_invites
+        end)
+    end
+    if not exclusion_guard_ready or not exclusion_guard_module
+        or exclusion_guard_module.is_player_excluded ~= allow_player then
+        pcall(function()
+            exclusion_guard_module = load("TradeExcluder")
+            exclusion_guard_module.is_player_excluded = allow_player
+            exclusion_guard_ready = exclusion_guard_module.is_player_excluded == allow_player
+        end)
+    end
 
     local DialogApp = apps.DialogApp
     if not DialogApp then return false end
@@ -207,16 +252,20 @@ local function install_accept_hook()
     -- __index), not the instance, and it returns a Promise (not a string).
     -- For a trade_request we short-circuit with a resolved promise carrying
     -- "Accept" - exactly what the waiting TradeApp handler expects.
-    if not DialogApp.__autotrade_hooked then
-        -- Adopt Me's promise module is "package:Promise" (NOT "Promise")
-        local Promise
-        pcall(function() Promise = load("package:Promise") end)
-        if not Promise then pcall(function() Promise = load("Promise") end) end
-        local cls = getmetatable(DialogApp)
-        cls = cls and cls.__index
-        if cls and cls.dialog and Promise then
+    DialogApp.__autotrade_hooked = false
+    -- Adopt Me's promise module is "package:Promise" (NOT "Promise")
+    local Promise
+    pcall(function() Promise = load("package:Promise") end)
+    local cls = getmetatable(DialogApp)
+    cls = cls and cls.__index
+    if cls and cls.dialog and Promise then
+        -- DialogApp instances can be replaced while retaining the same
+        -- class. Reuse our existing class hook instead of wrapping it once
+        -- more on every instance swap; reinstall only if the class or
+        -- method was genuinely replaced.
+        if cls ~= hooked_dialog_class or cls.dialog ~= hooked_dialog_fn then
             local orig = cls.dialog
-            cls.dialog = function(self, opts)
+            hooked_dialog_fn = function(self, opts)
                 if opts and opts.handle == "trade_request" then
                     mark_activity()
                     log("auto-accepting trade request (hooked dialog)")
@@ -226,10 +275,12 @@ local function install_accept_hook()
                 end
                 return orig(self, opts)
             end
-            DialogApp.__autotrade_hooked = true
-        elseif cls and cls.dialog and not Promise then
-            log("WARN: promise module not found; relying on open-dialog force-answer only")
+            cls.dialog = hooked_dialog_fn
+            hooked_dialog_class = cls
         end
+        DialogApp.__autotrade_hooked = true
+    elseif cls and cls.dialog and not Promise then
+        log("WARN: promise module not found; relying on open-dialog force-answer only")
     end
 
     -- (c) neutralize suspicious-captcha, scam warnings, unbalanced warnings, etc.
@@ -244,21 +295,28 @@ end
 -- A waiting dialog shows up as ticket_count > completed_ticket (is_dialog_open
 -- is unreliable - it reads false even while a request is on screen). The
 -- in-flight ticket is completed_ticket + 1; push "Accept" into it.
-local last_forced_ticket = 0
+local last_forced_dialog, last_forced_ticket = nil, 0
 local function clear_open_request()
     if not UIManager or not UIManager.apps then return end
     local D = UIManager.apps.DialogApp
     if not D or not D.force_response_signal then return end
+    if D ~= last_forced_dialog then
+        last_forced_dialog = D
+        last_forced_ticket = 0
+    end
     local count = D.ticket_count or 0
     local done  = D.completed_ticket or 0
     if count <= done then return end                 -- nothing waiting
     local ticket = done + 1
     if ticket == last_forced_ticket then return end  -- don't spam the same one
-    last_forced_ticket = ticket
-    pcall(function()
+    local fired = pcall(function()
         D.force_response_signal:Fire(ticket, table.pack("Accept"))
-        log("force-answered waiting dialog (ticket " .. ticket .. ")")
     end)
+    if fired then
+        last_forced_ticket = ticket
+        mark_activity()
+        log("force-answered waiting dialog (ticket " .. ticket .. ")")
+    end
 end
 
 --[[=====================================================================
@@ -301,8 +359,31 @@ local function summarize(items)
     return lines, #(items or {})
 end
 
+local function copy_trade_items(items)
+    local out = {}
+    for _, item in ipairs(items or {}) do
+        local props, src = {}, item.properties or {}
+        props.neon      = src.neon == true
+        props.mega_neon = src.mega_neon == true
+        props.rideable  = src.rideable == true
+        props.flyable   = src.flyable == true
+        out[#out+1] = { kind = item.kind, properties = props }
+    end
+    return out
+end
+
 local last_sig, last_sig_time = nil, 0
-local function send_trade_webhook(received, given, partner_name)
+local session_started_at = os.clock()
+local function format_duration(seconds)
+    seconds = math.max(0, math.floor(tonumber(seconds) or 0))
+    local hours = math.floor(seconds / 3600)
+    local minutes = math.floor(seconds % 3600 / 60)
+    local remaining = seconds % 60
+    return hours > 0 and string.format("%dh %dm %ds", hours, minutes, remaining)
+        or string.format("%dm %ds", minutes, remaining)
+end
+
+local function send_trade_webhook(received, given, partner_name, trade_number, elapsed)
     if not CONFIG.WEBHOOK.enabled or CONFIG.WEBHOOK.url == "" then return end
 
     -- dedup: a real second trade can't complete within a few seconds (lock
@@ -315,26 +396,38 @@ local function send_trade_webhook(received, given, partner_name)
     end
     last_sig, last_sig_time = sig, os.clock()
 
-    local fields = {}
+    local received_lines, received_total = summarize(received)
+    local given_lines, given_total = summarize(given)
+    local net_items = received_total - given_total
+    local fields = {
+        { name = "Trade #", value = tostring(trade_number or "?"), inline = true },
+        { name = "Runtime", value = format_duration(elapsed), inline = true },
+        { name = "Account", value = LocalPlayer.Name, inline = true },
+        { name = "Partner", value = partner_name or "unknown", inline = true },
+        { name = "Items received", value = tostring(received_total), inline = true },
+        { name = "Items given", value = tostring(given_total), inline = true },
+        { name = "Net items", value = (net_items >= 0 and "+" or "") .. tostring(net_items), inline = true },
+        { name = "Report mode", value = CONFIG.WEBHOOK.report, inline = true },
+    }
     local rep = CONFIG.WEBHOOK.report
     if rep ~= "given" then
-        local lines, n = summarize(received)
-        fields[#fields+1] = { name = ("Received (%d)"):format(n),
-            value = (#lines>0 and table.concat(lines, "\n") or "nothing"), inline = false }
+        fields[#fields+1] = { name = ("Received (%d)"):format(received_total),
+            value = (#received_lines>0 and table.concat(received_lines, "\n") or "nothing"), inline = false }
     end
     if rep == "given" or rep == "both" then
-        local lines, n = summarize(given)
-        fields[#fields+1] = { name = ("Given (%d)"):format(n),
-            value = (#lines>0 and table.concat(lines, "\n") or "nothing"), inline = false }
+        fields[#fields+1] = { name = ("Given (%d)"):format(given_total),
+            value = (#given_lines>0 and table.concat(given_lines, "\n") or "nothing"), inline = false }
     end
     local payload = {
         username = "ADM AutoTrade",
         embeds = {{
             title = "Trade complete",
-            description = partner_name and ("with **" .. partner_name .. "**") or nil,
+            description = ("Trade #%s completed with **%s** after %s"):format(
+                tostring(trade_number or "?"), tostring(partner_name or "unknown"), format_duration(elapsed)),
             color = 5763719,
             fields = fields,
             footer = { text = LocalPlayer.Name },
+            timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
         }},
     }
     local ok, body = pcall(function() return game:GetService("HttpService"):JSONEncode(payload) end)
@@ -344,6 +437,7 @@ end
 
 local app_cache = nil
 local function get_trade_app()
+    if not ensure_ui_manager() then return nil end
     local ok, app = pcall(function() return UIManager.apps.TradeApp end)
     if ok and app then
         if app ~= app_cache then app_cache = app patch_trade_app(app) end
@@ -356,17 +450,52 @@ end
 local last_stage, last_fire, stage_since = nil, 0, 0
 local action_busy, confirmation_fired = false, false
 local in_trade = false
+local initializing = true
 -- completion tracking for the webhook + WinterHub
 local completing = false
 local pending_received, pending_given, pending_partner = nil, nil, nil
 local trade_count = 0            -- completed trades this session (WinterHub count)
 local last_items = nil          -- items from the most recent completed trade
+local TRADE_APP_REPLACEMENT_GRACE = 5
+local trade_app_missing_since = nil
+
+local function capture_completion(app, state)
+    if not state or state.current_stage ~= "confirmation" then return false end
+    local mine    = app:_get_my_offer()
+    local partner = app:_get_partner_offer()
+    if not (mine and partner and mine.confirmed and partner.confirmed) then return false end
+
+    completing       = true
+    pending_received = copy_trade_items(partner.items)
+    pending_given    = copy_trade_items(mine.items)
+    local pp
+    if state.sender == LocalPlayer then
+        pp = state.recipient
+    else
+        pp = state.sender
+    end
+    pending_partner = (typeof(pp) == "Instance" and pp.Name) or nil
+    return true
+end
 
 local function step_trade()
     if not CONFIG.AUTO_ACCEPT.enabled then in_trade = false return end
 
     local app = get_trade_app()
-    if not app then last_stage = nil in_trade = false return end
+    -- A UI instance can disappear for a poll while the game replaces it.
+    -- Preserve lifecycle state briefly, but never leave WinterHub active
+    -- forever if the app does not return.
+    if not app then
+        if not in_trade and not last_stage then return end
+        trade_app_missing_since = trade_app_missing_since or os.clock()
+        if os.clock() - trade_app_missing_since < TRADE_APP_REPLACEMENT_GRACE then return end
+        log("TradeApp unavailable after replacement grace; clearing stale trade state")
+        last_stage, in_trade, completing = nil, false, false
+        pending_received, pending_given, pending_partner = nil, nil, nil
+        trade_app_missing_since = nil
+        return
+    end
+    trade_app_missing_since = nil
 
     local state = app:_get_local_trade_state()
     if not state then
@@ -374,7 +503,10 @@ local function step_trade()
             if completing then
                 trade_count = trade_count + 1
                 last_items  = pending_received
-                send_trade_webhook(pending_received, pending_given, pending_partner)
+                -- Network requests can stall; keep trade polling and the
+                -- WinterHub heartbeat independent from webhook latency.
+                task.spawn(send_trade_webhook, pending_received, pending_given, pending_partner,
+                    trade_count, os.clock() - session_started_at)
             end
             log("trade complete")
         end
@@ -397,18 +529,7 @@ local function step_trade()
     end
 
     -- detect real completion: both sides confirmed (cache items before close)
-    if stage == "confirmation" then
-        local mine    = app:_get_my_offer()
-        local partner = app:_get_partner_offer()
-        if mine and partner and mine.confirmed and partner.confirmed then
-            completing       = true
-            pending_received = partner.items
-            pending_given    = mine.items
-            local me   = LocalPlayer
-            local pp   = (state.sender == me) and state.recipient or state.sender
-            pending_partner = (typeof(pp) == "Instance" and pp.Name) or nil
-        end
-    end
+    pcall(capture_completion, app, state)
 
     local delay = stage == "confirmation" and CONFIG.AUTO_ACCEPT.confirmation_delay or CONFIG.AUTO_ACCEPT.negotiation_delay
     if os.clock() - stage_since < delay then return end
@@ -429,7 +550,14 @@ local function step_trade()
     elseif stage == "confirmation" then
         confirmation_fired = true
         local ok, err = pcall(function() current_app:_on_confirm_pressed() end)
-        if not ok then log("confirm error:", err) confirmation_fired = false end
+        if not ok then
+            log("confirm error:", err)
+            confirmation_fired = false
+        else
+            -- Some trades close before the next poll. Sample the offers again
+            -- immediately after the confirm handler while they are readable.
+            pcall(capture_completion, current_app, current_state)
+        end
     end
     action_busy = false
 end
@@ -468,11 +596,11 @@ end
 local function write_winterhub()
     if not CONFIG.WINTERHUB.enabled then return end
     if os.clock() - wh_last_write < CONFIG.WINTERHUB.heartbeat then return end
-    wh_last_write = os.clock()
 
     -- decide status: never hop mid-trade; hop only after the idle window
     local status = "active"
-    if not in_trade and (os.clock() - last_activity) > CONFIG.WINTERHUB.idle_hop_seconds then
+    if not initializing and not in_trade
+        and (os.clock() - last_activity) > CONFIG.WINTERHUB.idle_hop_seconds then
         status = "completed"
     end
 
@@ -482,10 +610,16 @@ local function write_winterhub()
         count  = trade_count,
         items  = summarize_items_for_wh(last_items),
     }
-    pcall(function()
+    local wrote = pcall(function()
         writefile(wh_file, game:GetService("HttpService"):JSONEncode(payload))
     end)
-    if status == "completed" then log("winterhub: status=completed (hop)") end
+    if wrote then
+        wh_last_write = os.clock()
+        if status == "completed" then log("winterhub: status=completed (hop)") end
+    else
+        log("winterhub: status write failed; retrying next poll")
+    end
+    return wrote
 end
 
 --[[=====================================================================
@@ -498,47 +632,64 @@ log("starting | accept:", CONFIG.AUTO_ACCEPT.enabled,
 -- is the CURRENT DialogApp instance actually hooked? (catches instance swaps
 -- where the UI replaces DialogApp after a cold load, leaving a stale hook)
 local function hook_ready()
-    if not UIManager or not UIManager.apps then return false end
-    local d = UIManager.apps.DialogApp
-    return d ~= nil and d.__autotrade_hooked == true
+    local ok, ready = pcall(function()
+        if not UIManager or not UIManager.apps then return false end
+        local d = UIManager.apps.DialogApp
+        local cls = d and getmetatable(d)
+        cls = cls and cls.__index
+        return d ~= nil and d.__autotrade_hooked == true
+            and cls ~= nil and cls == hooked_dialog_class
+            and cls.dialog == hooked_dialog_fn
+            and invite_guard_ready and exclusion_guard_ready
+            and invite_guard_module.can_receive_invites == allow_invites
+            and exclusion_guard_module.is_player_excluded == allow_player
+    end)
+    return ok and ready
 end
 
--- settings-only mode: nothing races, just force once and (maybe) exit
-if not CONFIG.AUTO_ACCEPT.enabled then
-    force_trade_settings()
-    if not CONFIG.WINTERHUB.enabled then
-        log("only settings enabled - done")
-        if getgenv then getgenv()[_guard_key] = nil end
-        return
+local settings_done = not CONFIG.FORCE_SETTINGS.enabled
+
+-- Settings-only mode has no long-running loop to retry from. Give late game
+-- modules a bounded chance to load before exiting.
+if not CONFIG.AUTO_ACCEPT.enabled and not CONFIG.WINTERHUB.enabled then
+    for _ = 1, 30 do
+        settings_done = force_trade_settings()
+        if settings_done then break end
+        task.wait(1)
     end
+    log(settings_done and "only settings enabled - done" or "settings unavailable after 30s")
+    if getgenv then getgenv()[_guard_key] = nil end
+    return
 end
 
 -- SPIN-WAIT: install the hook the instant the apps exist, before the first
 -- request can land. Fast retry (per-frame), not the slow 0.4s poll.
+pcall(write_winterhub)
 if CONFIG.AUTO_ACCEPT.enabled then
     local t0 = os.clock()
     repeat
-        install_accept_hook()
+        pcall(install_accept_hook)
+        pcall(write_winterhub)
         if hook_ready() then break end
         task.wait()
     until os.clock() - t0 > 30
     log(hook_ready() and "accept hook ready (spin)" or "hook not ready after 30s - will keep retrying")
 end
+initializing = false
 
-local settings_done = false
 while true do
     -- re-verify the hook every poll; re-install if DialogApp was swapped
     if CONFIG.AUTO_ACCEPT.enabled and not hook_ready() then
-        install_accept_hook()
+        pcall(install_accept_hook)
     end
 
     -- catch a trade-request dialog that was already open before we started
-    if CONFIG.AUTO_ACCEPT.enabled then clear_open_request() end
+    if CONFIG.AUTO_ACCEPT.enabled then pcall(clear_open_request) end
 
-    -- force settings only after the hook is confirmed in
-    if hook_ready() and not settings_done then
-        force_trade_settings()
-        settings_done = true
+    -- Prefer installing the accept hook first, but don't suppress the
+    -- independently configured settings forever if the hook cannot load.
+    if not settings_done and (not CONFIG.AUTO_ACCEPT.enabled or hook_ready() or not initializing) then
+        settings_done = force_trade_settings()
     end
 
     local ok, err = pcall(step_trade)
