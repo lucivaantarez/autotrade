@@ -56,6 +56,12 @@ local function text(instance)
     return ok and type(value) == "string" and value or nil
 end
 
+local function property(instance, name)
+    if not instance then return nil end
+    local ok, value = pcall(function() return instance[name] end)
+    return ok and value or nil
+end
+
 local function number(value)
     if type(value) == "number" then return value end
     if type(value) ~= "string" then return nil end
@@ -111,6 +117,13 @@ local function read_gui_state()
         status = "VERIFIED",
         phase = phase,
         in_game = visible(navigator) and not visible(play),
+        play_button = {
+            present = play ~= nil,
+            visible = visible(play),
+            active = property(play, "Active"),
+            interactable = property(play, "Interactable"),
+            class_name = property(play, "ClassName"),
+        },
         star_app_visible = visible(star_app),
         claim_visible = visible(claim),
         claim_eligible = visible(claim) and true or nil,
@@ -137,6 +150,10 @@ local function write_report(result)
             "username=" .. tostring(result.username),
             "status=" .. tostring(result.status),
             "startup_state=" .. tostring(result.startup_state),
+            "play_present=" .. tostring(result.play_button and result.play_button.present or "unavailable"),
+            "play_visible=" .. tostring(result.play_button and result.play_button.visible or "unavailable"),
+            "play_active=" .. tostring(result.play_button and result.play_button.active or "unavailable"),
+            "play_interactable=" .. tostring(result.play_button and result.play_button.interactable or "unavailable"),
             "claim_status=" .. tostring(result.daily_claim.status),
             "claim_verified=" .. tostring(result.daily_claim.verified),
             "stars=" .. tostring(result.stars or "unavailable"),
@@ -200,6 +217,7 @@ local function main()
                 or snapshot.phase == "favorite_color" and "Favorite Color handling"
                 or "Onboarding completion"
             result.startup_state = state
+            result.play_button = snapshot.play_button
             result.error = action .. " requires manual confirmation; automatic activation is disabled"
             result.error_info = error_info("BLOCKED", result.error)
             if action ~= last_manual_action then
