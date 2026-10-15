@@ -1,0 +1,14 @@
+Gemstone Result
+username=GraysoonCruz5
+status=FAILED
+startup_state=ONBOARDING
+claim_status=UNKNOWN
+claim_verified=false
+stars=unavailable
+gemstone_progress=unavailable
+gemstone_target=unavailable
+gemstone_price=unavailable
+timestamp=unavailable
+verification_status=BLOCKED
+error_code=BLOCKED
+error=Play activation is blocked pending verified activation behavior
