@@ -12,6 +12,7 @@ This directory contains the safe, adapter-driven Gemstone workflow. It is isolat
 - `winterhub_adapter.lua` — writes `<username>_winterswap.json` only for a verified completed result.
 - `workflow.lua` — orchestrates the modules and refuses completion when required statistics are unavailable.
 - `error_recovery.lua` — classifies failures and provides bounded retry behavior for adapter operations.
+- `mock_adapter.lua` — deterministic adapter for workflow tests and local harnesses.
 
 ## Adapter boundary
 
@@ -27,6 +28,10 @@ A live integration must explicitly provide these methods:
 - `claim_reward()`
 
 The repository does not currently contain a verified Gemstone runtime adapter or V6–V16 recording files. Therefore live startup and claim integration remain UNVERIFIED/BLOCKED. The modules are tested with deterministic simulated services.
+
+## Standalone entrypoint
+
+`../gemstone_daily_login.lua` is the standalone conservative adapter. It uses the observed GUI paths for detection and reporting. It does not activate Play/Home/Favorite Color or claim rewards because the supplied evidence does not verify a reliable activation/claim mechanism. Those states are reported as `BLOCKED` rather than treated as success.
 
 ## Test
 

@@ -4,7 +4,7 @@ import { join } from 'node:path';
 
 const root = new URL('./gemstone/', import.meta.url);
 const files = readdirSync(root).filter((name) => name.endsWith('.lua'));
-assert.equal(files.length, 8, 'all gemstone modules should exist');
+assert.equal(files.length, 9, 'all gemstone modules should exist');
 for (const file of files) {
   const source = readFileSync(new URL(file, root), 'utf8');
   assert.ok(source.includes('return'), `${file} must be a Lua module`);
@@ -19,6 +19,24 @@ for (const token of ['TIMEOUT', 'MISSING_DATA', 'MISSING_GUI', 'INTERACTION_FAIL
 const reporterSource = readFileSync(new URL('reporter.lua', root), 'utf8');
 for (const token of ['timestamp=', 'daily_streak=', 'error_code=']) {
   assert.ok(reporterSource.includes(token), `reporter must include ${token}`);
+}
+
+const standaloneSource = readFileSync(new URL('gemstone_daily_login.lua', new URL('./', import.meta.url)), 'utf8');
+for (const token of [
+  'NewsApp.EnclosingFrame.MainFrame.Buttons.PlayButton',
+  'DialogApp.Dialog.SpawnChooserDialog.UpperCardContainer.ChoicesContent.Choices.Home.Button',
+  'DialogApp.Dialog.ThemeColorDialog',
+  'StarRewardsApp.Static.Folder.Main.Backing.Content.ClaimScreen.ClaimButton.Button',
+  'StarRewardsApp.Static.Folder.Main.Backing.Content.MainScreen.GoalContainer.Content.GoalCount.Count',
+  'StarRewardsApp.Static.Folder.Main.Backing.Content.Header.CurrencyDisplay.Count',
+  'StarRewardsApp.Static.Folder.Main.Backing.Content.ShopScreen.Grid.Scroller.star_egg.PriceTag.Price',
+  'EnableLiveActions = false',
+  'is not implemented from verified evidence',
+]) {
+  assert.ok(standaloneSource.includes(token), `standalone adapter must contain ${token}`);
+}
+for (const forbidden of ['VirtualInputManager', 'hookmetamethod', 'FireServer', 'InvokeServer', 'ClaimLoginHandouts', 'StarRewardsNet']) {
+  assert.equal(standaloneSource.includes(forbidden), false, `standalone adapter must not use ${forbidden}`);
 }
 
 class MockAccount {
