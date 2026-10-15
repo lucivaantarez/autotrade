@@ -9,6 +9,7 @@ Date: 2026-10-16
 - Before/after claim verifier with duplicate-claim protection at the adapter boundary.
 - TXT and JSON TrackStat reporter.
 - WinterHub swap adapter that rejects incomplete or unverified results.
+- Shared error classification and bounded retry helper.
 - Orchestration workflow with failure reporting and required-statistics gating.
 - Deterministic mock simulation covering 9 scenarios.
 

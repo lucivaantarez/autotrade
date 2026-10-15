@@ -5,6 +5,7 @@ local Inspector = require(script.Parent.reward_inspector)
 local Claim = require(script.Parent.claim_verifier)
 local Reporter = require(script.Parent.reporter)
 local Swap = require(script.Parent.winterhub_adapter)
+local Recovery = require(script.Parent.error_recovery)
 
 local Workflow = {}
 
@@ -24,6 +25,11 @@ function Workflow.run(adapter, deps, options)
         verification_status = startup_state == Model.STATES.IN_GAME and "PENDING" or "BLOCKED",
         error = startup.error,
     }
+    local function set_error(message, code)
+        result.error = message
+        result.error_info = Recovery.detail(message, code)
+    end
+    if startup.error then set_error(startup.error) end
 
     if not result.game_ready then
         result.status = "FAILED"
@@ -36,7 +42,7 @@ function Workflow.run(adapter, deps, options)
     if before.status ~= Model.STATUS.VERIFIED then
         result.status = "FAILED"
         result.daily_claim.status = "UNKNOWN"
-        result.error = before.error or "reward state unavailable"
+        set_error(before.error or "reward state unavailable")
     else
         local claim = Claim.claim_once(adapter)
         result.daily_claim = claim
@@ -57,6 +63,7 @@ function Workflow.run(adapter, deps, options)
         result.status = claim.verified and stats_complete and "COMPLETED" or "FAILED"
         result.verification_status = claim.verified and stats_complete and "VERIFIED" or (claim.verified and "BLOCKED" or claim.status)
         result.error = claim.verified and stats_complete and nil or (claim.verified and "required statistics unavailable" or claim.reason)
+        if result.error then set_error(result.error) end
     end
 
     result.duration_seconds = ((options.clock and options.clock()) or os.clock()) - started
@@ -66,6 +73,7 @@ function Workflow.run(adapter, deps, options)
         result.status = "FAILED"
         result.verification_status = "BLOCKED"
         result.error = save_error or result.error or "report write failed"
+        set_error(result.error)
     end
     if Swap.eligible(result) then
         local ok, err = Swap.write(deps.fs, deps.json_encode, options.username, result, options.group)

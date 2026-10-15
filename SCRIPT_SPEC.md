@@ -94,6 +94,7 @@ The `gemstone/` modules are adapter-driven and game-agnostic. They may consume v
 - Reward inspection preserves unavailable values instead of inventing defaults.
 - Claim verification compares pre-claim and post-claim account state. A dismissed GUI is not success.
 - Reports are written as `gemstone_result.txt` and `gemstone_result.json` through an injected file adapter.
+- Failures include a classified `error_info.code` where possible; retry behavior is bounded and adapter-owned.
 - `<username>_winterswap.json` is written only when the result is `COMPLETED`, game readiness and claim verification are true, required statistics are present, and reporting succeeded.
 - Gemstone purchasing is not implemented and remains disabled.
 - Current repository evidence does not include a verified Gemstone live adapter or V6–V16 recordings; live integration is therefore BLOCKED/UNVERIFIED while deterministic mock behavior is covered by `test_gemstone_simulation.mjs`.

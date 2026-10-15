@@ -4,13 +4,17 @@ import { join } from 'node:path';
 
 const root = new URL('./gemstone/', import.meta.url);
 const files = readdirSync(root).filter((name) => name.endsWith('.lua'));
-assert.equal(files.length, 7, 'all gemstone modules should exist');
+assert.equal(files.length, 8, 'all gemstone modules should exist');
 for (const file of files) {
   const source = readFileSync(new URL(file, root), 'utf8');
   assert.ok(source.includes('return'), `${file} must be a Lua module`);
   for (const forbidden of ['VirtualInputManager', 'hookmetamethod', 'FireServer', 'InvokeServer', 'getgenv']) {
     assert.equal(source.includes(forbidden), false, `${file} must not perform live exploit operations`);
   }
+}
+const recoverySource = readFileSync(new URL('error_recovery.lua', root), 'utf8');
+for (const token of ['TIMEOUT', 'MISSING_DATA', 'MISSING_GUI', 'INTERACTION_FAILED', 'retry']) {
+  assert.ok(recoverySource.includes(token), `error recovery must define ${token}`);
 }
 
 class MockAccount {

@@ -11,6 +11,7 @@ This directory contains the safe, adapter-driven Gemstone workflow. It is isolat
 - `reporter.lua` — writes `gemstone_result.txt` and `gemstone_result.json` through an injected file adapter.
 - `winterhub_adapter.lua` — writes `<username>_winterswap.json` only for a verified completed result.
 - `workflow.lua` — orchestrates the modules and refuses completion when required statistics are unavailable.
+- `error_recovery.lua` — classifies failures and provides bounded retry behavior for adapter operations.
 
 ## Adapter boundary
 

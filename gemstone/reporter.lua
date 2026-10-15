@@ -21,6 +21,7 @@ local function text(result)
         "gemstone_price=" .. tostring(result.gemstone and result.gemstone.price or "unavailable"),
         "duration_seconds=" .. tostring(result.duration_seconds or "unavailable"),
         "verification_status=" .. tostring(result.verification_status or "UNKNOWN"),
+        "error_code=" .. tostring(result.error_info and result.error_info.code or "NONE"),
         "error=" .. tostring(result.error or "none"),
     }
     return table.concat(lines, "\n") .. "\n"
