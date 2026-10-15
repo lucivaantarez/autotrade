@@ -31,6 +31,7 @@ function Reader.read(adapter)
         gemstone_target = field(target, "adapter"),
         gemstone_price = field(price, "adapter"),
         remaining_stars = field(remaining, "derived"),
+        observed_at = field(Model.number(raw.timestamp) or os.time(), raw.timestamp and "adapter" or "observation"),
         raw = raw,
     }
     if progress == nil and target == nil then

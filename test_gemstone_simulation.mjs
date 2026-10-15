@@ -16,6 +16,10 @@ const recoverySource = readFileSync(new URL('error_recovery.lua', root), 'utf8')
 for (const token of ['TIMEOUT', 'MISSING_DATA', 'MISSING_GUI', 'INTERACTION_FAILED', 'retry']) {
   assert.ok(recoverySource.includes(token), `error recovery must define ${token}`);
 }
+const reporterSource = readFileSync(new URL('reporter.lua', root), 'utf8');
+for (const token of ['timestamp=', 'daily_streak=', 'error_code=']) {
+  assert.ok(reporterSource.includes(token), `reporter must include ${token}`);
+}
 
 class MockAccount {
   constructor({ claimed = false, slow = false, unexpected = false, delayed = false, partial = false, missingReward = false, verifyFail = false } = {}) {

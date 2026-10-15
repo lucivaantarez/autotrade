@@ -11,6 +11,8 @@ local function text(result)
         "Gemstone Result",
         "version=" .. tostring(result.version or "1.0"),
         "username=" .. tostring(result.username or "unknown"),
+        "timestamp=" .. tostring(result.timestamp or "unavailable"),
+        "daily_streak=" .. tostring(result.daily_streak or "unavailable"),
         "status=" .. tostring(result.status or "UNKNOWN"),
         "startup_state=" .. tostring(result.startup_state or "UNKNOWN"),
         "claim_status=" .. tostring(result.daily_claim and result.daily_claim.status or "UNKNOWN"),

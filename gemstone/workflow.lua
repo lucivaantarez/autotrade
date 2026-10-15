@@ -47,6 +47,9 @@ function Workflow.run(adapter, deps, options)
         local claim = Claim.claim_once(adapter)
         result.daily_claim = claim
         local after = Inspector.read(adapter)
+        result.username = result.username or (after.username and after.username.value) or (before.username and before.username.value)
+        result.daily_streak = after.daily_streak and after.daily_streak.value or (before.daily_streak and before.daily_streak.value)
+        result.timestamp = after.observed_at and after.observed_at.value or (before.observed_at and before.observed_at.value)
         result.stars = after.stars and after.stars.value or before.stars.value
         result.gemstone = {
             progress = after.gemstone_progress and after.gemstone_progress.value or nil,
