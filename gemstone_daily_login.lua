@@ -16,6 +16,7 @@ local CONFIG = {
     SwapGroup = "finished",
     PollLimit = 120,
     PollStep = 0.25,
+    ManualAssistPolls = 360, -- bounded 90-second manual onboarding window
     EnableLiveActions = false, -- remains false until separately verified
 }
 
@@ -184,7 +185,9 @@ local function main()
 
     local state = STATE.WAITING_FOR_GAME
     local snapshot
-    for _ = 1, CONFIG.PollLimit do
+    local manual_remaining = CONFIG.ManualAssistPolls
+    local last_manual_action
+    for _ = 1, CONFIG.PollLimit + CONFIG.ManualAssistPolls do
         snapshot = read_gui_state()
         if snapshot.status == "VERIFIED" then
             if snapshot.in_game then
@@ -197,9 +200,14 @@ local function main()
                 or snapshot.phase == "favorite_color" and "Favorite Color handling"
                 or "Onboarding completion"
             result.startup_state = state
-            result.error = action .. " is blocked pending verified activation behavior"
+            result.error = action .. " requires manual confirmation; automatic activation is disabled"
             result.error_info = error_info("BLOCKED", result.error)
-            break
+            if action ~= last_manual_action then
+                warn("[gemstone] " .. result.error)
+                last_manual_action = action
+            end
+            manual_remaining = manual_remaining - 1
+            if manual_remaining <= 0 then break end
         end
         task.wait(CONFIG.PollStep)
     end

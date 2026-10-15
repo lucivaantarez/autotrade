@@ -31,7 +31,7 @@ for (const token of [
   'StarRewardsApp.Static.Folder.Main.Backing.Content.Header.CurrencyDisplay.Count',
   'StarRewardsApp.Static.Folder.Main.Backing.Content.ShopScreen.Grid.Scroller.star_egg.PriceTag.Price',
   'EnableLiveActions = false',
-  'is not implemented from verified evidence',
+  'requires manual confirmation; automatic activation is disabled',
 ]) {
   assert.ok(standaloneSource.includes(token), `standalone adapter must contain ${token}`);
 }

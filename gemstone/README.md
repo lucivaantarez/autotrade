@@ -31,7 +31,7 @@ The repository does not currently contain a verified Gemstone runtime adapter or
 
 ## Standalone entrypoint
 
-`../gemstone_daily_login.lua` is the standalone conservative adapter. It uses the observed GUI paths for detection and reporting. It does not activate Play/Home/Favorite Color or claim rewards because the supplied evidence does not verify a reliable activation/claim mechanism. Those states are reported as `BLOCKED` rather than treated as success.
+`../gemstone_daily_login.lua` is the standalone conservative adapter. It uses the observed GUI paths for detection and reporting. It does not activate Play/Home/Favorite Color or claim rewards because the supplied evidence does not verify a reliable activation/claim mechanism. When it sees an onboarding screen, it gives the operator a bounded manual-assist window to complete the screen manually, then continues observing. If onboarding is not completed before the timeout, it reports `BLOCKED`.
 
 ## Test
 
