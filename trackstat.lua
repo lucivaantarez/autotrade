@@ -1,254 +1,219 @@
--- TrackStat: read-only Adopt Me statistics tracker
---
--- Purpose:
---   Observe the currently available Star Rewards GUI and write a compact TXT
---   report for the current account. This script does not click, purchase,
---   invoke remotes, hook connections, or control another automation script.
---
--- Output:
---   trackstat_result.txt
---
--- Timing:
---   Normal scan: every 2 seconds
---   Stable verification: 3 matching samples, 0.5 seconds apart
+-- TRACKSTAT V21 | Targeted continuous read-only scanner
+-- Evidence baseline: ClientData + new:StarRewardsDB, LocalPlayer only.
+-- Does not open StarRewards GUI, claim rewards, purchase items, call game remotes,
+-- or transmit Roblox authentication credentials.
 
 local Players = game:GetService("Players")
-local LocalPlayer = Players.LocalPlayer
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local player = Players.LocalPlayer
 
-local CONFIG = {
-    ScanInterval = 2,
-    StableInterval = 0.5,
-    StableSamples = 3,
-    ReportFile = "trackstat_result.txt",
-    UnavailableHeartbeat = 30,
-}
+local INTERVAL = 2
+local HEARTBEAT = 60
+local TXT = "trackstat_result.txt"
+local JSON = "trackstat_result.json"
+local VERSION = "21.0"
 
-local PATH = {
-    star_app = "StarRewardsApp",
-    claim = "StarRewardsApp.Static.Folder.Main.Backing.Content.ClaimScreen.ClaimButton.Button",
-    progress = "StarRewardsApp.Static.Folder.Main.Backing.Content.MainScreen.GoalContainer.Content.GoalCount.Count",
-    stars = "StarRewardsApp.Static.Folder.Main.Backing.Content.Header.CurrencyDisplay.Count",
-}
+local env = (type(getgenv) == "function" and getgenv()) or _G
+if env.__TRACKSTAT_V21 and env.__TRACKSTAT_V21.running then
+    env.__TRACKSTAT_V21.running = false
+end
+local state = { running = true, upload_busy = false, last_upload_signature = nil, last_upload_at = 0 }
+env.__TRACKSTAT_V21 = state
+local remoteConfig = env.__TRACKSTAT_CONFIG or {}
+local REMOTE_URL = type(remoteConfig.endpoint) == "string" and remoteConfig.endpoint or nil
+local REMOTE_TOKEN = type(remoteConfig.device_token) == "string" and remoteConfig.device_token or nil
+local UPLOAD_HEARTBEAT = 60
 
-local function find_path(root, path)
-    local current = root
-    for segment in string.gmatch(path, "[^%.]+") do
-        if not current then return nil end
-        current = current:FindFirstChild(segment)
+local function stamp()
+    local ok, result = pcall(os.date, "%Y-%m-%d %H:%M:%S")
+    return ok and result or tostring(os.time())
+end
+
+local function log(kind, msg)
+    print(string.format("[%s] [TRACKSTAT] %s | %s", stamp(), kind, msg))
+end
+
+local function safeLoad()
+    local fsysObj = ReplicatedStorage:FindFirstChild("Fsys")
+    if not fsysObj then return nil, nil, "Fsys missing" end
+    local ok, fsys = pcall(require, fsysObj)
+    if not ok or type(fsys) ~= "table" or type(fsys.load) ~= "function" then
+        return nil, nil, "Fsys unavailable"
     end
-    return current
-end
-
-local function get_gui()
-    return LocalPlayer and LocalPlayer:FindFirstChildOfClass("PlayerGui")
-end
-
-local function read_text(instance)
-    if not instance then return nil end
-    local ok, value = pcall(function() return instance.Text end)
-    return ok and type(value) == "string" and value or nil
-end
-
-local function parse_number(value)
-    if type(value) == "number" then return value end
-    if type(value) ~= "string" then return nil end
-    return tonumber(value:match("%-?%d+%.?%d*"))
-end
-
-local function parse_progress(value)
-    if type(value) ~= "string" then return nil, nil end
-    local current, target = value:match("(%d+)%s*/%s*(%d+)")
-    return tonumber(current), tonumber(target)
-end
-
-local function is_visible(instance)
-    if not instance then return false end
-    local ok, value = pcall(function() return instance.Visible end)
-    return ok and value == true
-end
-
-local function scan()
-    local gui = get_gui()
-    if not gui then
-        return {
-            complete = false,
-            reason = "PlayerGui unavailable",
-        }
+    local loaded, client = pcall(fsys.load, "ClientData")
+    if not loaded or type(client) ~= "table" or type(client.get_data) ~= "function" then
+        return nil, nil, "ClientData unavailable"
     end
+    local dbOk, db = pcall(fsys.load, "new:StarRewardsDB")
+    if not dbOk or type(db) ~= "table" then db = nil end
+    return client, db
+end
 
-    local app = find_path(gui, PATH.star_app)
-    local claim = find_path(gui, PATH.claim)
-    local progress_node = find_path(gui, PATH.progress)
-    local stars_node = find_path(gui, PATH.stars)
+local function number(v)
+    return type(v) == "number" and v or nil
+end
 
-    local progress_text = read_text(progress_node)
-    local progress, target = parse_progress(progress_text)
-    local stars = parse_number(read_text(stars_node))
-
-    local claim_visible = is_visible(claim)
-    local app_visible = is_visible(app)
-
-    local reward_status
-    if claim_visible then
-        reward_status = "AVAILABLE"
-    elseif app_visible and progress ~= nil and stars ~= nil then
-        -- Absence of ClaimButton is not proof of an already-claimed reward.
-        reward_status = "NOT_VISIBLE"
-    else
-        reward_status = "UNKNOWN"
+local function read(client, db)
+    local ok, all = pcall(client.get_data)
+    if not ok or type(all) ~= "table" then return nil, "ClientData not ready" end
+    local own = all[player.Name]
+    if type(own) ~= "table" then return nil, "Local player data not ready" end
+    local reward = own.star_rewards_manager
+    local daily = own.daily_login_manager
+    if type(reward) ~= "table" or type(daily) ~= "table" then
+        return nil, "Reward managers not ready"
     end
-
-    local complete = type(stars) == "number"
-        and type(progress) == "number"
-        and type(target) == "number"
-
+    local stars = number(own.stars)
+    local goal = reward.current_goal
+    local goalDef = db and type(goal) == "string" and db[goal] or nil
+    local price = type(goalDef) == "table" and number(goalDef.price) or nil
+    local claimed = type(reward.claimed) == "boolean" and reward.claimed or nil
+    local nextClaim = number(reward.next_claim_timestamp)
     return {
-        complete = complete,
-        reason = complete and nil or "Required Star Rewards values unavailable",
-        username = LocalPlayer and LocalPlayer.Name or "unknown",
+        version = VERSION,
+        username = player.Name,
+        account_id = tostring(player.UserId),
+        observed_at = stamp(),
+        observed_unix = os.time(),
+        status = stars ~= nil and claimed ~= nil and "READY" or "PARTIAL",
+        source = "ClientData",
         stars = stars,
-        daily_reward = {
-            status = reward_status,
-            claim_visible = claim_visible,
-        },
-        gemstone = {
-            progress = progress,
-            target = target,
-        },
-        progress_text = progress_text,
-        app_visible = app_visible,
+        daily_streak = number(daily.streak),
+        longest_streak = number(daily.longest_streak),
+        claimed = claimed,
+        daily = claimed == nil and "UNKNOWN" or (claimed and "CLAIMED" or "UNCLAIMED"),
+        current_goal = goal,
+        egg_price = price,
+        stars_remaining = stars and price and math.max(0, price - stars) or nil,
+        next_claim_timestamp = nextClaim,
+        next_claim_in_seconds = number(daily.time_until_next_streak),
+        progress_kind = "balance_vs_price",
     }
 end
 
-local function same_values(a, b)
-    if not a or not b then return false end
-    return a.complete == b.complete
-        and a.username == b.username
-        and a.stars == b.stars
-        and a.daily_reward.status == b.daily_reward.status
-        and a.gemstone.progress == b.gemstone.progress
-        and a.gemstone.target == b.gemstone.target
+local function value(v)
+    if v == nil then return "--" end
+    return tostring(v)
 end
 
-local function build_result(snapshot, verified)
-    local result = {
-        version = "1.0",
-        username = snapshot.username or (LocalPlayer and LocalPlayer.Name or "unknown"),
-        stars = snapshot.stars,
-        daily_reward = snapshot.daily_reward,
-        gemstone = snapshot.gemstone,
-        last_sync = verified and os.time() or nil,
-        verification_status = verified and "VERIFIED" or "UNAVAILABLE",
-        scan_interval_seconds = CONFIG.ScanInterval,
-        stable_samples = CONFIG.StableSamples,
-        reason = snapshot.reason,
-    }
-    return result
+local function formatLine(r)
+    return string.format("Stars: %s/%s | Streak: %s | Daily: %s | Left: %s",
+        value(r.stars), value(r.egg_price), value(r.daily_streak), r.daily, value(r.stars_remaining))
 end
 
-local function value_or_unavailable(value)
-    return value == nil and "unavailable" or tostring(value)
+local function request_function()
+    if type(request) == "function" then return request end
+    if type(http_request) == "function" then return http_request end
+    if type(syn) == "table" and type(syn.request) == "function" then return syn.request end
+    return nil
 end
 
-local function report_text(result)
-    return table.concat({
-        "TrackStat Result",
-        "username=" .. value_or_unavailable(result.username),
-        "verification_status=" .. value_or_unavailable(result.verification_status),
-        "stars=" .. value_or_unavailable(result.stars),
-        "daily_reward_status=" .. value_or_unavailable(result.daily_reward and result.daily_reward.status),
-        "claim_visible=" .. value_or_unavailable(result.daily_reward and result.daily_reward.claim_visible),
-        "gemstone_progress=" .. value_or_unavailable(result.gemstone and result.gemstone.progress),
-        "gemstone_target=" .. value_or_unavailable(result.gemstone and result.gemstone.target),
-        "last_sync=" .. value_or_unavailable(result.last_sync),
-        "scan_interval_seconds=" .. tostring(result.scan_interval_seconds),
-        "stable_samples=" .. tostring(result.stable_samples),
-        "reason=" .. value_or_unavailable(result.reason),
-    }, "\n") .. "\n"
+local function upload_once(result)
+    if not REMOTE_URL or not REMOTE_TOKEN then return false, "remote sync not configured" end
+    local send = request_function()
+    if not send then return false, "executor HTTP request unavailable" end
+    local ok, response = pcall(send, {
+        Url = REMOTE_URL,
+        Method = "POST",
+        Headers = {
+            ["Content-Type"] = "application/json",
+            ["Authorization"] = "Bearer " .. REMOTE_TOKEN,
+        },
+        Body = HttpService:JSONEncode(result),
+    })
+    if not ok or type(response) ~= "table" then return false, "request failed" end
+    local code = tonumber(response.StatusCode or response.Status or 0)
+    if code == 200 or code == 202 then return true end
+    return false, "server rejected report (HTTP " .. tostring(code) .. ")"
 end
 
-local function print_result(result)
-    print("[trackstat] ------------------------------")
-    print("[trackstat] username: " .. value_or_unavailable(result.username))
-    print("[trackstat] stars: " .. value_or_unavailable(result.stars))
-    print("[trackstat] daily reward: " .. value_or_unavailable(result.daily_reward and result.daily_reward.status))
-    print("[trackstat] gemstone: "
-        .. value_or_unavailable(result.gemstone and result.gemstone.progress)
-        .. "/"
-        .. value_or_unavailable(result.gemstone and result.gemstone.target))
-    print("[trackstat] last_sync: " .. value_or_unavailable(result.last_sync))
-    print("[trackstat] status: " .. value_or_unavailable(result.verification_status))
-    if result.reason then
-        print("[trackstat] reason: " .. tostring(result.reason))
-    end
-    print("[trackstat] ------------------------------")
-end
-
-local function write_report(result)
-    if type(writefile) ~= "function" then
-        warn("[trackstat] writefile is unavailable; console output only")
-        return false
-    end
-
-    local ok, err = pcall(function()
-        writefile(CONFIG.ReportFile, report_text(result))
-    end)
-    if not ok then
-        warn("[trackstat] report write failed: " .. tostring(err))
-        return false
-    end
-    return true
-end
-
-local function stable_sample()
-    local first = scan()
-    if not first.complete then
-        return first, false
-    end
-
-    for _ = 2, CONFIG.StableSamples do
-        task.wait(CONFIG.StableInterval)
-        local next_sample = scan()
-        if not same_values(first, next_sample) then
-            return next_sample, false
+local function upload_async(result, signature)
+    if not REMOTE_URL or not REMOTE_TOKEN then return end
+    local heartbeat_due = os.clock() - state.last_upload_at >= UPLOAD_HEARTBEAT
+    if state.upload_busy or (state.last_upload_signature == signature and not heartbeat_due) then return end
+    state.upload_busy = true
+    task.spawn(function()
+        local delays = { 0, 2, 5, 10 }
+        local success, reason = false, nil
+        for attempt = 1, #delays do
+            if delays[attempt] > 0 then task.wait(delays[attempt]) end
+            success, reason = upload_once(result)
+            if success then break end
         end
+        if success then
+            state.last_upload_signature = signature
+            state.last_upload_at = os.clock()
+            log("SYNCED", "Server accepted statistics")
+        elseif reason ~= "remote sync not configured" then
+            log("SYNC_FAILED", reason or "unknown upload error")
+        end
+        state.upload_busy = false
+    end)
+end
+local function save(r)
+    if type(writefile) ~= "function" then return end
+    local text = table.concat({
+        "TRACKSTAT V" .. VERSION,
+        "Updated: " .. r.observed_at,
+        "Status: " .. r.status,
+        "Account: " .. value(r.username),
+        formatLine(r),
+        "Goal: " .. value(r.current_goal),
+        "Next claim timestamp: " .. value(r.next_claim_timestamp),
+        "Progress meaning: Stars balance / item price (not lifetime progress)",
+    }, "\n")
+    pcall(writefile, TXT, text)
+    pcall(function() writefile(JSON, HttpService:JSONEncode(r)) end)
+end
+
+log("STARTED", "Scan: 2s | Target: LocalPlayer | Read-only")
+task.spawn(function()
+    local client, db
+    local previous, lastHeartbeat, lastIssue = nil, os.clock(), nil
+    while state.running do
+        local success, err = pcall(function()
+            if not client then
+                local reason
+                client, db, reason = safeLoad()
+                if not client then error(reason or "ClientData unavailable") end
+            end
+            if not db then
+                local fsysObj = ReplicatedStorage:FindFirstChild("Fsys")
+                if fsysObj then
+                    local fsys = require(fsysObj)
+                    local ok, loaded = pcall(fsys.load, "new:StarRewardsDB")
+                    if ok and type(loaded) == "table" then db = loaded end
+                end
+            end
+            local result, reason = read(client, db)
+            if not result then error(reason) end
+            local signature = table.concat({value(result.stars), value(result.egg_price),
+                value(result.daily_streak), result.daily, value(result.current_goal),
+                value(result.next_claim_timestamp)}, "|")
+            if signature ~= previous then
+                log(previous and "UPDATED" or "READY", formatLine(result))
+                previous = signature
+            end
+            lastIssue = nil
+            save(result)
+            upload_async(result, signature)
+            if os.clock() - lastHeartbeat >= HEARTBEAT then
+                log("ALIVE", formatLine(result))
+                lastHeartbeat = os.clock()
+            end
+        end)
+        if not success then
+            local issue = tostring(err):gsub("^.-:%d+: ", "")
+            if issue ~= lastIssue then log("WAITING", issue) end
+            lastIssue = issue
+            if issue:find("ClientData") or issue:find("Fsys") then client = nil end
+            if os.clock() - lastHeartbeat >= HEARTBEAT then
+                log("ALIVE", "Waiting for game data")
+                lastHeartbeat = os.clock()
+            end
+        end
+        task.wait(INTERVAL)
     end
-
-    return first, true
-end
-
-local last_report_key
-local last_unavailable_at = 0
-
-local function report_key(result)
-    return table.concat({
-        tostring(result.username),
-        tostring(result.stars),
-        tostring(result.daily_reward and result.daily_reward.status),
-        tostring(result.gemstone and result.gemstone.progress),
-        tostring(result.gemstone and result.gemstone.target),
-        tostring(result.verification_status),
-    }, "|")
-end
-
-print("[trackstat] started; scanning every " .. tostring(CONFIG.ScanInterval) .. " seconds")
-print("[trackstat] read-only mode; no clicks, purchases, remotes, or hooks")
-
-while true do
-    local snapshot, verified = stable_sample()
-    local result = build_result(snapshot, verified)
-    local key = report_key(result)
-    local now = os.clock()
-
-    if verified and key ~= last_report_key then
-        last_report_key = key
-        write_report(result)
-        print_result(result)
-    elseif not verified and (now - last_unavailable_at) >= CONFIG.UnavailableHeartbeat then
-        last_unavailable_at = now
-        write_report(result)
-        print_result(result)
-    end
-
-    task.wait(CONFIG.ScanInterval)
-end
+    log("STOPPED", "Scanner replaced or stopped")
+end)
