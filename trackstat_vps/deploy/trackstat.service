@@ -1,0 +1,23 @@
+[Unit]
+Description=TrackStat receipt API and dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trackstat
+Group=trackstat
+WorkingDirectory=/opt/trackstat
+EnvironmentFile=/etc/trackstat/trackstat.env
+ExecStart=/opt/trackstat/.venv/bin/python /opt/trackstat/trackstat_vps/server.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/trackstat
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

@@ -89,6 +89,16 @@ class TrackStatBackendTests(unittest.TestCase):
         self.assertIsNone(normalized)
         self.assertIn("ClientData", error)
 
+    def test_database_survives_reinitialization(self):
+        normalized, error = server.normalize_report(self.report(observed_unix=3000, stars=7))
+        self.assertIsNone(error)
+        server.ingest(normalized)
+        server.init_db()
+        rows = server.list_accounts()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["stars"], 7)
+        self.assertEqual(rows[0]["observed_unix"], 3000)
+
     def test_status_categories_are_age_based(self):
         normalized, error = server.normalize_report(self.report())
         self.assertIsNone(error)
