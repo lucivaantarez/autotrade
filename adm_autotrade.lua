@@ -1,41 +1,39 @@
---[[=====================================================================
-    adm_autotrade.lua  -  Adopt Me auto-trader (for Delta)
+--[[ adm_autotrade.lua - Adopt Me trade automation for Delta.
 
-    What it does: your account automatically accepts incoming trades and
-    clicks through them to the end. Made for moving pets between your own
-    accounts.
+Accepts incoming trade requests and drives each trade to completion for
+accounts you own. The in-game script controls the trade UI and writes local
+status and send webhook reports; server hopping is external.
 
-    HOW TO USE: you only ever edit the CONFIG block right below. Turn each
-    feature on or off with its "enabled" line, save, and push to GitHub.
-    Nothing else in the file needs touching.
+Edit only the CONFIG table below. The rest of the file is load-bearing.
 
-    What each part does:
-      1. CONFIG        - all your on/off switches and settings (edit this)
-      2. SETUP         - loads the game's own code so the script can use it
-      3. FORCE SETTINGS- sets your Trading option to "Everyone" so bots can
-                         send you trades
-      4. AUTO-ACCEPT   - taps "Accept" on the trade request pop-up for you
-      5. TRADE DRIVER  - walks the trade through Accept then Confirm to finish
-      6. WINTERHUB     - writes a small status file that tells the WinterHub
-                         app when to hop to the next server
-      7. MAIN LOOP     - runs everything on repeat and never crashes out
-=======================================================================]]
+Sections, in file order:
+  Configuration           switches and timings
+  Initialization          dependencies, anti-AFK, singleton guard, settings
+  Trade Request Handling  dialog hook and startup dialog recovery
+  Webhook Reporting       compact embeds and delivery rules
+  Empty Trade Recovery    deadline, cancellation adapter, failure accounting
+  Trade Lifecycle         stage driver and completion capture
+  WinterHub Integration   status file consumed by the hop agent
+  Main Loop               hook repair, stepping, heartbeat
 
---[[=====================================================================
-    1. CONFIG  -  THIS IS THE ONLY PART YOU NEED TO EDIT
-       Change the values below. true = on, false = off.
-=======================================================================]]
+Cancellation reaches a native entry point whose contract is unverified. A
+call is a request only: no trade is counted as cancelled without an observed
+close.
+--]]
+
+-- Configuration
+-- The only section meant to be edited. `true` enables, `false` disables.
 local CONFIG = {
 
     -- Master switch. Set to false and the whole script does nothing.
     MASTER_ENABLED = true,
 
     FORCE_SETTINGS = {
-        -- Sets your in-game Trading option to "Everyone" on startup, so your
-        -- bot accounts are actually allowed to send you trades. (StarPets and
-        -- other logins reset this to "Friends", which blocks the bots.)
+        -- Sets the in-game Trading option to "Everyone" at startup so peer
+        -- accounts may send requests. Some logins reset this to "Friends",
+        -- which would otherwise block them.
         enabled = true,
-        -- Also do the same for gifting ("give" requests), not just trades.
+        -- Apply the same change to gifting ("give" requests).
         also_force_giving = true,
     },
 
@@ -83,22 +81,19 @@ local CONFIG = {
     WEBHOOK = {
         -- Send a Discord message every time a trade finishes.
         enabled = true,
-        -- Paste your Discord webhook link here (between the quotes).
-        -- SECURITY: keep this OUT of a public repo. Regenerate if leaked.
+        -- Endpoint that receives trade reports. Keep deployment-specific
+        -- values out of version control, and rotate anything that leaks.
         url = "https://saturnity.site/api/tradelogs",
         -- What the message lists: "received" (what you got), "given" (what you
         -- gave), or "both".
         report = "received",
     },
 
-    -- Print progress messages in the Delta console. Handy while testing;
-    -- set to false for a quiet run.
+    -- Print progress messages to the Delta console; useful while testing.
     DEBUG = false,
 }
 
---[[=====================================================================
-    2. SETUP
-=======================================================================]]
+-- Initialization
 local function log(...) if CONFIG.DEBUG then print("[autotrade]", ...) end end
 
 if not CONFIG.MASTER_ENABLED then
@@ -109,10 +104,10 @@ end
 local Players     = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
 
--- SINGLETON GUARD (per-account): two clones share one Delta env + getgenv,
--- so a single global flag would make clone 2 abort. Key it on UserId instead:
--- each account gets its own slot, but a real double-execute on the SAME
--- account still aborts (prevents doubled webhooks).
+-- Per-account singleton guard. Two clones share one Delta environment and one
+-- getgenv, so a plain global would make the second clone abort. Keying on
+-- UserId gives each account its own slot while still blocking a genuine
+-- double-execute on one account, which would double-report webhooks.
 local _guard_key = "__adm_autotrade_" .. tostring(LocalPlayer.UserId)
 if getgenv then
     if getgenv()[_guard_key] then
@@ -122,8 +117,8 @@ if getgenv then
     getgenv()[_guard_key] = true
 end
 
--- ANTI-AFK: stop Roblox's 20-min idle kick. Install side effects only after
--- the singleton guard so rejected duplicate executions add no listeners.
+-- Anti-AFK: prevents the 20-minute idle kick. Side effects are installed
+-- only after the singleton guard, so a rejected duplicate adds no listeners.
 pcall(function()
     local VirtualUser = game:GetService("VirtualUser")
     LocalPlayer.Idled:Connect(function()
@@ -172,9 +167,8 @@ end
 local last_activity = os.clock()
 local function mark_activity() last_activity = os.clock() end
 
---[[=====================================================================
-    3. FORCE SETTINGS  -  Trading -> Everyone (saves to server immediately)
-=======================================================================]]
+-- Settings forcing. Writes trade and give visibility as "Everyone" and
+-- persists it, so peer accounts are allowed to send requests.
 local function force_everyone(id)
     ensure_deps()
     local changed = false
@@ -205,14 +199,12 @@ local function force_trade_settings()
     return trade_setting_done and giving_setting_done
 end
 
---[[=====================================================================
-    4. AUTO-ACCEPT  -  auto-answer Adopt Me's own trade-request dialog
-       We let the game's native accept path run (it does the real
-       InvokeServer + the trade-start handshake that opens the window).
-       We just (a) stop it auto-declining on join, (b) answer its dialog
-       with "Accept", (c) skip the suspicious-captcha / scam popups so
-       nothing can hang. Returns true once the dialog hook is in place.
-=======================================================================]]
+-- Trade Request Handling
+-- The game keeps ownership of the accept path: its own handler performs the
+-- server call and the handshake that opens the trade window. This section
+-- stops the auto-decline on join, answers the dialog with "Accept", and
+-- neutralizes the captcha and scam popups that would otherwise stall the
+-- flow. install_accept_hook returns true once the hook is in place.
 -- Neutralize every blocking popup in the trade flow on the TradeApp instance.
 -- All are method calls (self:method()), so instance overrides shadow the class.
 local function patch_trade_app(app)
@@ -234,7 +226,7 @@ end
 local hooked_dialog_class, hooked_dialog_fn
 -- Declared early: the dialog hook, clear_open_request and the webhook builders
 -- must share the same empty-trade table and successful-trade counter. The
--- table itself is filled in by EMPTY_TRADE_LOGIC.
+-- table itself is defined by the Empty Trade Recovery section.
 local empty_trade
 local trade_count
 local invite_guard_ready, exclusion_guard_ready = false, false
@@ -316,10 +308,9 @@ local function install_accept_hook()
     return DialogApp.__autotrade_hooked == true
 end
 
--- If a trade-request dialog is ALREADY waiting when we start (your bot sends
--- before the script executes), the hook above only catches FUTURE dialogs.
--- A waiting dialog shows up as ticket_count > completed_ticket (is_dialog_open
--- is unreliable - it reads false even while a request is on screen). The
+-- The hook above only sees future dialogs. A request that is already waiting
+-- when the script starts is visible only as ticket_count > completed_ticket,
+-- because is_dialog_open reads false while a request is on screen. The
 -- in-flight ticket is completed_ticket + 1; push "Accept" into it.
 local last_forced_dialog, last_forced_ticket = nil, 0
 local function clear_open_request()
@@ -346,12 +337,10 @@ local function clear_open_request()
     end
 end
 
---[[=====================================================================
-    8. WEBHOOK  -  Discord notify on completed trade (real display names)
-       Translates each item's `kind` -> KindDB[kind].name in-game, groups
-       by name + form, and posts quantities. Fires only when BOTH sides
-       confirmed (a real completion, not a cancel).
-=======================================================================]]
+-- Webhook Reporting
+-- Each item's `kind` is resolved through KindDB and grouped by display name
+-- so the embed carries real names and quantities. A completion event is
+-- emitted only when both sides confirmed, never for a cancel.
 -- Returns ok, status, err. A 2xx response is a delivered webhook; 429, 5xx and
 -- a missing status (request error / executor without StatusCode) are transient;
 -- any other 4xx is permanent. A transport failure is NEVER reported as ok.
@@ -652,12 +641,12 @@ local last_items = nil          -- items from the most recent completed trade
 local TRADE_APP_REPLACEMENT_GRACE = 5
 local trade_app_missing_since = nil
 
---[[ EMPTY_TRADE_LOGIC_START ]]
--- Server-scoped empty-offer recovery state. A session is created once when a
--- trade first becomes visible and is closed only when the trade state goes nil.
--- The failure counter is deliberately NOT reset by TradeApp disappearance or
--- by an unrelated cancellation; only a verified successful trade or a server
--- transition resets it.
+-- Empty Trade Recovery
+-- A partner that offers nothing is put on a per-session deadline. A session
+-- is created when a trade first becomes visible and closed only when the
+-- trade state goes nil. The failure counter is deliberately not reset by
+-- TradeApp disappearance or by an unrelated cancellation: only a verified
+-- successful trade or a server transition resets it.
 empty_trade = {
     session_seq = 0,
     session = nil,
@@ -812,8 +801,9 @@ local EMPTY_CLOSE_WINDOW = 5
 local EMPTY_CANCEL_BACKOFF = 5
 local EMPTY_CANCEL_CALL_WATCHDOG = 15
 
--- Partner display name, if the trade state exposes one. Used for the failure
--- webhook and to make sure we only cancel the session the timer belongs to.
+-- Partner display name, when the trade state exposes one. Used for the
+-- failure webhook and to ensure only the session that owns the timer is
+-- cancelled.
 local function empty_trade_partner_name(state)
     if type(state) ~= "table" then return nil end
     local pp
@@ -1235,7 +1225,9 @@ local function process_empty_trade(app, state)
     end
     return block()
 end
---[[ EMPTY_TRADE_LOGIC_END ]]
+-- Trade Lifecycle
+-- Drives a live trade from negotiation to confirmation, and books a
+-- completion only when both offers were confirmed before the state went nil.
 
 local function capture_completion(app, state)
     if not state or state.current_stage ~= "confirmation" then return false end
@@ -1374,22 +1366,21 @@ local function step_trade()
     action_busy = false
 end
 
---[[=====================================================================
-    6. WINTERHUB  -  write <username>_winteraddons.json so the agent hops
-       Contract (game-agnostic):
-         status : "completed"           -> agent hops to next server
-                  "disconnected"/"error"-> agent rejoins same server
-                  anything else          -> keep going
-         ts     : os.time() (Unix sec). File older than ~40s = dead -> relaunch.
-         count  : trades done (dashboard progress)
-         items  : { { name=, qty= }, ... } (live on dashboard)
-       We report "completed" when no trade has been received for
-       idle_hop_seconds AND no trade is currently open (never hop mid-trade).
-       Otherwise "active", refreshed on a heartbeat so we never look dead.
-       A latched empty-offer server (EMPTY_TRADE.max_consecutive_failures)
-       reports "completed" on every heartbeat until the server changes - the
-       agent must not keep farming a server that refuses to offer items.
-=======================================================================]]
+-- WinterHub Integration
+-- Writes <username>_winteraddons.json for the external hop agent.
+-- Contract:
+--   status  "completed"              agent hops to the next server
+--           "disconnected"/"error"   agent rejoins the same server
+--           anything else            keep going
+--   ts      os.time(); the agent treats a file older than roughly 40s as
+--           dead and relaunches the account
+--   count   completed trades, for dashboard progress
+--   items   { { name=, qty= }, ... } from the latest completed trade
+--
+-- "completed" is reported when no trade arrived for idle_hop_seconds and no
+-- trade is open, so the agent never hops mid-trade. Otherwise "active" is
+-- refreshed on a heartbeat. A latched empty-offer server keeps reporting
+-- "completed" until the server changes, so the agent stops farming it.
 local wh_file = LocalPlayer.Name .. "_winteraddons.json"
 local wh_last_write = 0
 
@@ -1472,9 +1463,7 @@ local function write_winterhub()
     return true, dispatched
 end
 
---[[=====================================================================
-    7. MAIN LOOP
-=======================================================================]]
+-- Main Loop
 log("starting | accept:", CONFIG.AUTO_ACCEPT.enabled,
     "| settings:", CONFIG.FORCE_SETTINGS.enabled,
     "| winterhub:", CONFIG.WINTERHUB.enabled)
@@ -1616,8 +1605,8 @@ while true do
     -- catch a trade-request dialog that was already open before we started
     if CONFIG.AUTO_ACCEPT.enabled then pcall(clear_open_request) end
 
-    -- Prefer installing the accept hook first, but don't suppress the
-    -- independently configured settings forever if the hook cannot load.
+    -- Install the accept hook first, but do not withhold the independently
+    -- configured settings if the hook cannot load.
     if not settings_done and (not CONFIG.AUTO_ACCEPT.enabled or hook_ready() or not initializing) then
         settings_done = force_trade_settings()
     end
