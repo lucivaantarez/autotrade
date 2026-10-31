@@ -55,14 +55,14 @@ These came from decompiled-module analysis. They are correct and load-bearing.
 
 Single file. **Only the CONFIG block is meant to be edited.** Sections:
 
-1. **CONFIG** — on/off switches: `MASTER_ENABLED`, `FORCE_SETTINGS`, `AUTO_ACCEPT` (`poll`, `refire_every`), `WINTERHUB` (`idle_hop_seconds`, `heartbeat`), `WEBHOOK` (`url`, `report`), `DEBUG`.
-2. **SETUP** — anti-AFK (VirtualUser on `Idled`); **per-account singleton guard** keyed on `getgenv()["__adm_autotrade_" .. UserId]` (two Delta clones share one env, so a plain global would abort clone 2 — keying on UserId lets each account run but blocks a true double-execute on the same account). Loads `UIManager` eagerly; loads `SettingsHelper`/`SettingsDB`/`KindDB` lazily *after* the hook is in (getting the accept hook in fast prevents the first-request race).
+1. **CONFIG** — on/off switches: `MASTER_ENABLED`, `FORCE_SETTINGS`, `AUTO_ACCEPT` (`poll`, `refire_every`), `EMPTY_TRADE` (`timeout_seconds`, `max_consecutive_failures`), `WINTERHUB` (`idle_hop_seconds`, `heartbeat`), `WEBHOOK` (`url`, `report`), `DEBUG`.
+2. **SETUP** — anti-AFK (VirtualUser on `Idled`); **per-account singleton guard** keyed on `getgenv()["__adm_autotrade_" .. UserId]` (two Delta clones share one env, so a plain global would abort clone 2 — keying on UserId lets each account run but blocks a true double-execute on the same account). A failed `Fsys` bootstrap releases that guard so the script can be retried. Loads `UIManager` eagerly and retries it if startup was too early; loads `SettingsHelper`/`SettingsDB`/`KindDB` lazily and independently *after* the hook is in, retrying any dependency that was unavailable during partial startup (getting the accept hook in fast prevents the first-request race).
 3. **FORCE SETTINGS** — trade/give → Everyone.
 4. **AUTO-ACCEPT** — installs the `DialogApp.dialog` hook (short-circuits `trade_request` with a resolved `"Accept"` promise) + patches TradeApp popups. `clear_open_request()` handles a dialog already waiting at startup.
-5. **TRADE DRIVER** (`step_trade`) — reads state, caches offers at confirmation, delays and revalidates each action, retries negotiation conservatively, confirms once per confirmation stage, detects real completion, bumps `trade_count`, triggers webhook + updates `last_items`.
-6. **WINTERHUB** (`write_winterhub`) — writes the status file on a heartbeat (see contract below).
-7. **MAIN LOOP** — spin-waits to install the hook the instant `apps` exist; re-verifies the hook each poll (re-installs on DialogApp instance swap); forces settings once hook confirmed; runs `step_trade` + `write_winterhub` under pcall so it never crashes out.
-8. **WEBHOOK** — Discord embed on completion; dedup by signature within a ~6s window (a real second trade can't complete that fast due to lock timers).
+5. **TRADE DRIVER** (`step_trade`) — reads state, caches offers at confirmation, delays and revalidates each action, retries negotiation conservatively, confirms once per confirmation stage, samples completion both before and immediately after confirm, bumps `trade_count`, triggers webhook + updates `last_items`. A transient TradeApp replacement preserves the lifecycle for a short grace period; if the app never returns, stale state is cleared so WinterHub cannot remain active forever. Empty-partner-offer recovery runs first: one 15s deadline per session, UNKNOWN ≠ EMPTY, a fresh read at the boundary, and at most one failure record per session.
+6. **WINTERHUB** (`write_winterhub`) — writes the status file on a heartbeat (see contract below); failed writes remain immediately retryable. Three consecutive empty-offer failures latch `completed` until the server changes. If cancellation is unavailable, a stuck empty trade reports `error` (rejoin same server) rather than freezing or faking completion.
+7. **MAIN LOOP** — spin-waits to install the hook the instant `apps` exist while continuing an `active` WinterHub heartbeat; re-verifies the dialog class/method and invite guards each poll; retries settings after the hook attempt without suppressing them forever if the hook is unavailable; protects hook repair, startup-dialog recovery, trade stepping, and heartbeat writes so one transient error cannot kill the loop.
+8. **WEBHOOK** — one compact Discord embed per event: `Trade Complete #N` (green), `Trade Failed` (red), `Server Skipped` (amber). No fields, no footer, native timestamp, short multiline description. `CONFIG.WEBHOOK.report` selects received/given/both item lines; item names and quantities are preserved. Delivery validates 2xx, retries 429/5xx/missing-status up to three times, never retries other 4xx, and dedupes by stable event id. Trade success, HTTP delivery, and WinterHub status writing are separate outcomes.
 
 ---
 
@@ -96,7 +96,9 @@ itself.
 
 **Rules the writer must obey:**
 - Never emit `completed` mid-trade (`in_trade` guards this). Hop only after the idle window with no open trade.
-- `ts` must keep refreshing even when idle — a background heartbeat, or the agent thinks the account froze and relaunches it.
+- Exception: after three consecutive confirmed empty-offer failures, `completed` is latched (`empty_trade_limit`) until the server changes. Do not revert it to `active` on later heartbeats; keep `count` and `items` truthful.
+- `error` is also used when an empty trade cannot be cancelled because no verified native cancellation API is available. That means "rejoin this server", never "trade completed".
+- `ts` must keep refreshing even during hook startup and when idle — a background heartbeat, or the agent thinks the account froze and relaunches it. Do not advance the local heartbeat timer unless the status write succeeded.
 - This contract replaced the older Cloudflare-Worker mailbox + `IDLE_WATCHDOG` kick/rehop mechanism. Don't reintroduce those.
 
 **Separate Swap contract** (full account rotation, distinct from trade/hop):
@@ -134,7 +136,7 @@ that closes **without both sides confirmed**.
 
 - **Independent state watcher:** polls `TradeApp:_get_local_trade_state()` itself (re-fetches the app each tick, so it's immune to the `app_cache` stale-swap bug), snapshotting offers + `confirmed` flags + stage every tick a trade is open.
 - **On close without completion:** writes a report — partner, **stage it died at**, **`me`/`partner` confirmed flags**, **your offer + partner offer** (labeled pets), **last trade remotes fired** (filtered `__namecall` hook), and **the in-game failure text** if the game printed one.
-- **Fail vs cancel:** only tags `FAILED` if an error message appeared near the close; a clean close with no error is `CANCELLED` (off by default via `LOG_CANCELS = false`).
+- **Fail vs cancel:** only tags `FAILED` if an error message appeared near the close; a clean close with no error is `CANCELLED` (currently enabled via `LOG_CANCELS = true` so incomplete closes are preserved).
 - Output: rolling `<username>_tradefails.log` + one Discord embed per fail. Config: `CONFIG.WEBHOOK.url`, `LOG_CANCELS`, `LOG_REMOTES`, `BUFFER`, `POLL`.
 
 **Reading a report (maps to §6 causes):**
@@ -166,9 +168,28 @@ common causes in this system:
 Server-side anti-cheat/moderation kick. Either executor detection (blanket) or
 an invalid/impossible trade action sequence. Use blackbox to tell which.
 
-### Latent code bugs (present but usually sidestepped by the spin-wait/settings-login flow — fix if refactoring the driver)
-- **`app_cache` never re-fetches on a TradeApp instance swap.** If the UI replaces the TradeApp app object, `get_trade_app()` keeps returning the stale one. Should invalidate on swap (same class of bug as the DialogApp re-hook the main loop already does).
-- **`pending_partner` via `and/or` ternary** — the `(cond and a) or b` fallback pattern can pick the wrong branch when `a` is falsy. Prefer an explicit `if`.
+### Reliability guards already enforced
+- **TradeApp instance swaps:** `get_trade_app()` re-fetches `UIManager.apps.TradeApp` and patches each replacement instead of retaining a stale object.
+- **DialogApp instance swaps:** startup-ticket deduplication is scoped to the current DialogApp instance, and the class hook is not wrapped repeatedly when only the instance changes. Invite/exclusion overrides are identity-checked and restored if another script replaces them.
+- **Startup-dialog recovery:** a failed forced response remains retryable, and a successful response marks activity before WinterHub can consider hopping.
+- **Partial dependency startup:** `SettingsHelper`, `SettingsDB`, and `KindDB` load independently and missing modules are retried; settings are not marked complete until both configured updates succeed, while an already-successful setting is not sent repeatedly.
+- **Bootstrap recovery:** an initial `UIManager` miss is retried, and an `Fsys` load failure clears the per-account singleton guard before reporting the error.
+- **Partner selection:** completion tracking uses an explicit sender/recipient branch rather than an `and/or` pseudo-ternary.
+- **Heartbeat isolation:** completion webhooks run asynchronously so a slow endpoint cannot block WinterHub status refreshes.
+- **Heartbeat delivery:** startup emits `active`, continues heartbeat writes during the hook spin, and retries failed file writes without waiting a full heartbeat interval.
+- **Completion sampling:** offer confirmation is captured before and immediately after the confirm handler, reducing missed accounting when the trade closes between polls.
+
+### Empty-offer recovery (V2)
+- One 15s deadline per trade session. It starts when the session is first observed and never restarts on a 0.4s poll. It is not a maximum trade duration.
+- Partner offers are counted with `pairs`, so both sequential arrays and UID-keyed dictionaries work. **Every present entry counts as an item**, whatever its shape: the live diagnostic counted the real offer as 0 → 1 → 2 while the old predicate required `kind`/`id`/`uid`, which could read a populated offer as zero and cancel it. A nil/unreadable offer is `UNKNOWN`, never `EMPTY`.
+- Once any partner item is observed, the empty countdown is permanently satisfied for that session. Inserting then removing an item must not cancel or fake a success.
+- At the deadline the script re-reads the app, state, and offer. It never cancels from stale poll data, and a throwing state getter is `UNKNOWN`, not a close.
+- The cancellation adapter is dispatched in a spawned task. A yielding or never-returning call cannot suspend the trade loop or the WinterHub heartbeat; a per-session in-flight flag prevents overlapping calls, and a 15s watchdog converts an unsettled call into outcome `unknown`.
+- Outcome states are `requested`, `unavailable`, `failed`, and `unknown`. None means "cancelled". A failure is recorded only after the window is observed closed by the **same** TradeApp instance within the 5s window; a replacement instance, a missing app, or a failed read is never proof of closure.
+- While the outcome is unresolved, accept/confirm is blocked and cached completions are dropped — an `UNKNOWN` offer read is not permission to act.
+- If the partner's offer becomes readable and populated, the session's cancellation bookkeeping is dropped and normal trading resumes, so a genuine later completion is still counted and reported. The counter increments at most once per session; a successful trade resets it; server JobId change resets it. TradeApp disappearance does not reset it.
+- Three consecutive failures latch WinterHub `completed`, stop new accepts, and dispatch one Server Skipped event after a successful status write. The dispatch is asynchronous; local suppression is not server-enforced exactly-once delivery.
+- **Native cancellation (wired, contract unverified):** `TradeApp._decline_trade` is observed to exist in the live client. With `CONFIG.EMPTY_TRADE.auto_decline = true` the adapter calls it with no extra arguments once the 15s deadline passes on a readable-empty offer, because its parameter list is unknown and a guessed argument is worse than a call that simply does nothing. Its return value is ignored: the call is a request, and only an observed close on the same TradeApp instance records a failure. If it throws, is missing, or the window stays open, nothing is counted and WinterHub receives `error` (same-server rejoin). Do not invent `_on_cancel_pressed` or arbitrary remotes. Set `auto_decline = false` to restore the previous no-call behaviour.
 
 ### Security
 - The Discord **webhook URL is in plaintext** in `CONFIG.WEBHOOK.url`. If the repo is public, **regenerate it** and keep it out of version control (untracked config file, or proxy through the existing Cloudflare Worker).
@@ -183,9 +204,10 @@ Behavior changes to reduce 267s / "unexpectedly failed":
 3. **One action in flight** at a time; confirmation fires once per confirmation stage.
 
 Still queued if diagnostics show they are needed:
-4. **Ownership gate** before offering a UID.
-5. **Exponential back-off on kick** (15s → 30s → 60s rejoin) instead of instant rehammer.
-6. **Randomize anti-AFK** movement if kicks happen while idle.
+4. **Verified native cancellation API** for empty trades (the adapter is intentionally blocked until one is confirmed).
+5. **Ownership gate** before offering a UID.
+6. **Exponential back-off on kick** (15s → 30s → 60s rejoin) instead of instant rehammer.
+7. **Randomize anti-AFK** movement if kicks happen while idle.
 
 ---
 
